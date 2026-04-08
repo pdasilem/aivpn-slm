@@ -18,7 +18,8 @@
         android:textColor="@color/text_primary"
         android:maxLines="1"
         android:ellipsize="end"
-        android:paddingStart="4dp" />
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp" />
 
     <ImageButton
         android:id="@+id/btnDelete"
@@ -26,7 +27,7 @@
         android:layout_height="32dp"
         android:src="@android:drawable/ic_menu_close_clear_cancel"
         android:background="?attr/selectableItemBackgroundBorderless"
-        android:contentDescription="Delete"
+        android:contentDescription="@string/content_delete"
         android:scaleType="centerInside"
         app:tint="@color/text_secondary" />
 

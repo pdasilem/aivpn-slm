@@ -4,7 +4,6 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/background"
     android:fillViewport="true">
 
     <LinearLayout
@@ -105,7 +104,7 @@
                     android:id="@+id/textTimer"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="00:00:00"
+                    android:text="@string/timer_zero"
                     android:textSize="32sp"
                     android:textColor="@color/accent"
                     android:fontFamily="monospace"
@@ -140,7 +139,7 @@
                             android:id="@+id/textUpload"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="0 B"
+                            android:text="@string/bytes_zero"
                             android:textSize="16sp"
                             android:textColor="@color/text_primary"
                             android:fontFamily="monospace" />
@@ -172,7 +171,7 @@
                             android:id="@+id/textDownload"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="0 B"
+                            android:text="@string/bytes_zero"
                             android:textSize="16sp"
                             android:textColor="@color/text_primary"
                             android:fontFamily="monospace" />
@@ -203,7 +202,7 @@
                             android:id="@+id/textDuration"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="00:00"
+                            android:text="@string/duration_zero"
                             android:textSize="16sp"
                             android:textColor="@color/text_primary"
                             android:fontFamily="monospace" />
@@ -258,18 +257,12 @@
                         android:paddingEnd="12dp" />
                 </LinearLayout>
 
-                <!-- Scrollable profile list (populated programmatically) -->
-                <ScrollView
+                <!-- Profile list (populated programmatically) -->
+                <LinearLayout
+                    android:id="@+id/profileList"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:maxHeight="200dp">
-
-                    <LinearLayout
-                        android:id="@+id/profileList"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:orientation="vertical" />
-                </ScrollView>
+                    android:orientation="vertical" />
 
                 <!-- Connection key (manual entry) -->
                 <com.google.android.material.textfield.TextInputLayout

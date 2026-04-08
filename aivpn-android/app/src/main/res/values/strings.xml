@@ -6,30 +6,27 @@
     <string name="status_connecting">Connecting…</string>
     <string name="status_connected">Connected to %s</string>
     <string name="status_reconnecting">Reconnecting…</string>
-    <string name="status_error">Error: %s</string>
     <string name="btn_connect">Connect</string>
     <string name="btn_disconnect">Disconnect</string>
-    <string name="hint_server">Server address</string>
-    <string name="hint_server_example">e.g. 1.2.3.4:443</string>
-    <string name="hint_server_key">Server public key (Base64)</string>
-    <string name="hint_psk">Client PSK (Base64)</string>
-    <string name="hint_vpn_ip">VPN IP (e.g. 10.0.0.2)</string>
     <string name="hint_connection_key">Connection key</string>
     <string name="hint_connection_key_example">aivpn://…</string>
     <string name="error_fill_fields">Fill in server address and key</string>
     <string name="error_invalid_connection_key">Invalid connection key</string>
     <string name="error_vpn_denied">VPN permission denied</string>
-    <string name="error_invalid_key">Invalid key (need 32 bytes)</string>
-    <string name="error_handshake">Handshake failed</string>
     <string name="label_upload">Upload</string>
     <string name="label_download">Download</string>
     <string name="label_duration">Duration</string>
+    <string name="timer_zero">00:00:00</string>
+    <string name="duration_zero">00:00</string>
+    <string name="bytes_zero">0 B</string>
     <string name="version_footer">v0.5.0 · AI-powered DPI evasion</string>
     <string name="notification_channel">AIVPN Tunnel</string>
     <string name="notification_channel_desc">Active VPN tunnel status</string>
     <string name="notification_connecting">Connecting…</string>
     <string name="notification_connected">Connected to %s</string>
     <string name="btn_theme">Theme</string>
+    <string name="btn_theme_dark">Dark</string>
+    <string name="btn_theme_light">Light</string>
     <string name="label_profiles">Saved Keys</string>
     <string name="btn_add_key">+ Add</string>
     <string name="dialog_add_profile">Add Connection Key</string>
@@ -55,16 +52,31 @@
     <string name="split_tunnel_search">Search…</string>
     <string name="split_tunnel_system">Hide syst.</string>
     <string name="split_tunnel_all">All</string>
+    <string name="content_back">Back</string>
+    <string name="content_add">Add</string>
+    <string name="content_delete">Delete</string>
     <string name="split_tunnel_tab_apps">Apps</string>
     <string name="split_tunnel_tab_sites">Sites</string>
-    <string name="split_tunnel_vpn_count">%d via VPN</string>
-    <string name="split_tunnel_bypass_count">%d bypass VPN</string>
     <string name="split_tunnel_none">All traffic via VPN</string>
-    <string name="split_tunnel_hint_apps">%d apps</string>
-    <string name="split_tunnel_hint_sites">%d sites</string>
     <string name="split_tunnel_hint_combined">%1$s via VPN, %2$s bypass VPN</string>
     <string name="split_tunnel_add_domain">Enter domain…</string>
     <string name="split_tunnel_domain_hint">Traffic to these domains will bypass VPN</string>
     <string name="split_tunnel_domain_invalid">Invalid domain format</string>
     <string name="split_tunnel_domain_exists">Domain already added</string>
+    <plurals name="split_tunnel_hint_apps">
+        <item quantity="one">%d app</item>
+        <item quantity="other">%d apps</item>
+    </plurals>
+    <plurals name="split_tunnel_hint_sites">
+        <item quantity="one">%d site</item>
+        <item quantity="other">%d sites</item>
+    </plurals>
+    <plurals name="split_tunnel_vpn_count">
+        <item quantity="one">%d via VPN</item>
+        <item quantity="other">%d via VPN</item>
+    </plurals>
+    <plurals name="split_tunnel_bypass_count">
+        <item quantity="one">%d bypass VPN</item>
+        <item quantity="other">%d bypass VPN</item>
+    </plurals>
 </resources>

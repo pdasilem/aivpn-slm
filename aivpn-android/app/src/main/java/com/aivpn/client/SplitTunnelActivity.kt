@@ -1,8 +1,8 @@
 package com.aivpn.client
 
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.ApplicationInfo
-import android.content.pm.PackageManager
 import android.os.Bundle
 import android.text.Editable
 import android.text.TextWatcher
@@ -20,7 +20,9 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.aivpn.client.databinding.ActivitySplitTunnelBinding
 import com.google.android.material.tabs.TabLayout
+import java.util.Locale
 
+@SuppressLint("NotifyDataSetChanged")
 class SplitTunnelActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivitySplitTunnelBinding
@@ -115,7 +117,7 @@ class SplitTunnelActivity : AppCompatActivity() {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
             override fun afterTextChanged(s: Editable?) {
-                searchQuery = s?.toString()?.trim()?.lowercase() ?: ""
+                searchQuery = s?.toString()?.trim()?.lowercase(Locale.ROOT) ?: ""
                 applyFilter()
             }
         })
@@ -145,15 +147,9 @@ class SplitTunnelActivity : AppCompatActivity() {
         val pm = packageManager
         val ownPackage = packageName
 
-        // MATCH_ALL was added in API 33 (Android 13)
-        // For older versions, use 0 (default behavior)
-        val flags = if (android.os.Build.VERSION.SDK_INT >= 33) {
-            PackageManager.MATCH_ALL
-        } else {
-            0
-        }
-
-        allApps = pm.getInstalledApplications(flags)
+        val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        allApps = pm.queryIntentActivities(launcherIntent, 0)
+            .map { resolveInfo -> resolveInfo.activityInfo.applicationInfo }
             .filter { appInfo ->
                 // Exclude own package
                 appInfo.packageName != ownPackage
@@ -170,7 +166,7 @@ class SplitTunnelActivity : AppCompatActivity() {
             .distinctBy { it.packageName }
             .sortedWith(
                 compareBy<AppEntry> { !allowedPackages.contains(it.packageName) }
-                    .thenBy { it.name.lowercase() }
+                    .thenBy { it.name.lowercase(Locale.ROOT) }
             )
         applyFilter()
     }
@@ -179,8 +175,8 @@ class SplitTunnelActivity : AppCompatActivity() {
         filteredApps = allApps.filter { app ->
             val matchesSystem = !hideSystemApps || !app.isSystem
             val matchesSearch = searchQuery.isEmpty() ||
-                app.name.lowercase().contains(searchQuery) ||
-                app.packageName.lowercase().contains(searchQuery)
+                app.name.lowercase(Locale.ROOT).contains(searchQuery) ||
+                app.packageName.lowercase(Locale.ROOT).contains(searchQuery)
             matchesSystem && matchesSearch
         }
         appAdapter.notifyDataSetChanged()
@@ -234,7 +230,7 @@ class SplitTunnelActivity : AppCompatActivity() {
 
     private fun addDomain() {
         val raw = binding.editDomain.text.toString().trim()
-            .lowercase()
+            .lowercase(Locale.ROOT)
             .removePrefix("http://")
             .removePrefix("https://")
             .removeSuffix("/")
@@ -274,11 +270,11 @@ class SplitTunnelActivity : AppCompatActivity() {
         binding.textCounter.text = when {
             appCount > 0 && domainCount > 0 -> getString(
                 R.string.split_tunnel_hint_combined,
-                getString(R.string.split_tunnel_hint_apps, appCount),
-                getString(R.string.split_tunnel_hint_sites, domainCount)
+                resources.getQuantityString(R.plurals.split_tunnel_hint_apps, appCount, appCount),
+                resources.getQuantityString(R.plurals.split_tunnel_hint_sites, domainCount, domainCount)
             )
-            appCount > 0 -> getString(R.string.split_tunnel_vpn_count, appCount)
-            domainCount > 0 -> getString(R.string.split_tunnel_bypass_count, domainCount)
+            appCount > 0 -> resources.getQuantityString(R.plurals.split_tunnel_vpn_count, appCount, appCount)
+            domainCount > 0 -> resources.getQuantityString(R.plurals.split_tunnel_bypass_count, domainCount, domainCount)
             else -> ""
         }
     }
@@ -333,7 +329,7 @@ class SplitTunnelActivity : AppCompatActivity() {
         override fun onBindViewHolder(holder: VH, position: Int) {
             holder.domain.text = excludedDomains[position]
             holder.delete.setOnClickListener {
-                val pos = holder.adapterPosition
+                val pos = holder.bindingAdapterPosition
                 if (pos >= 0 && pos < excludedDomains.size) {
                     excludedDomains.removeAt(pos)
                     saveDomains()
