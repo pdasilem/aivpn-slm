@@ -5,7 +5,6 @@
 use serde::{Deserialize, Serialize};
 use rand::{Rng, distributions::Distribution};
 use rand::distributions::weighted::WeightedIndex;
-use serde_bytes::ByteBuf;
 
 use crate::error::{Error, Result};
 
@@ -58,9 +57,12 @@ pub struct MaskProfile {
 pub enum SpoofProtocol {
     None,
     QUIC,
-    WebRTC_STUN,
-    HTTPS_H2,
-    DNS_over_UDP,
+    #[serde(rename = "WebRTC_STUN")]
+    WebRtcStun,
+    #[serde(rename = "HTTPS_H2")]
+    HttpsH2,
+    #[serde(rename = "DNS_over_UDP")]
+    DnsOverUdp,
 }
 
 /// Packet size distribution
@@ -305,7 +307,7 @@ pub mod preset_masks {
             version: 1,
             created_at: 0,
             expires_at: u64::MAX,
-            spoof_protocol: SpoofProtocol::WebRTC_STUN,
+            spoof_protocol: SpoofProtocol::WebRtcStun,
             header_template: vec![0x00, 0x01, 0x02, 0x03], // STUN-like
             eph_pub_offset: 4,
             eph_pub_length: 32,

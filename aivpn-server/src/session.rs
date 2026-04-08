@@ -17,9 +17,9 @@ use tracing::info;
 
 use aivpn_common::crypto::{
     self, SessionKeys, KeyPair, TAG_SIZE, X25519_PUBLIC_KEY_SIZE, 
-    NONCE_SIZE, CHACHA20_KEY_SIZE, DEFAULT_WINDOW_MS,
+    NONCE_SIZE, DEFAULT_WINDOW_MS,
 };
-use aivpn_common::protocol::{InnerType, InnerHeader, ControlPayload, ControlSubtype};
+use aivpn_common::protocol::ControlPayload;
 use aivpn_common::mask::MaskProfile;
 use aivpn_common::error::{Error, Result};
 
@@ -83,7 +83,7 @@ pub struct Session {
     /// Counter value used as the base for the currently precomputed tag window.
     pub tag_window_base: u64,
     /// Received tag bitmap (for anti-replay)
-    pub received_bitmap: u256,
+    pub received_bitmap: U256,
     /// Accumulated inbound bytes to flush into client_db in batches.
     pub pending_bytes_in: u64,
 
@@ -106,12 +106,12 @@ pub struct Session {
 
 /// 256-bit bitmap for tracking received packets
 #[derive(Debug, Clone, Copy, Default)]
-pub struct u256 {
+pub struct U256 {
     lo: u128,
     hi: u128,
 }
 
-impl u256 {
+impl U256 {
     pub fn set_bit(&mut self, bit: usize) {
         if bit < 128 {
             self.lo |= 1u128 << bit;
@@ -160,7 +160,7 @@ impl Session {
             send_counter: 0,
             expected_tags: HashMap::with_capacity(TAG_WINDOW_SIZE),
             tag_window_base: 0,
-            received_bitmap: u256::default(),
+            received_bitmap: U256::default(),
             pending_bytes_in: 0,
             server_eph_pub: None,
             server_hello_signature: None,
@@ -289,7 +289,7 @@ impl Session {
     pub fn update_fsm(&mut self) {
         if let Some(mask) = &self.mask {
             let duration_ms = self.fsm_state_start.elapsed().as_millis() as u64;
-            let (new_state, size_override, iat_override, padding_override) = 
+            let (new_state, _size_override, _iat_override, _padding_override) =
                 mask.process_transition(self.fsm_state, self.fsm_packets, duration_ms);
             
             if new_state != self.fsm_state {
@@ -362,15 +362,13 @@ pub struct SessionManager {
     server_keys: KeyPair,
     /// Server's signing key (Ed25519)
     signing_key: ed25519_dalek::SigningKey,
-    /// Default mask profile
-    default_mask: MaskProfile,
 }
 
 impl SessionManager {
     pub fn new(
         server_keys: KeyPair,
         signing_key: ed25519_dalek::SigningKey,
-        default_mask: MaskProfile,
+        _default_mask: MaskProfile,
     ) -> Self {
         Self {
             sessions: DashMap::new(),
@@ -379,7 +377,6 @@ impl SessionManager {
             next_ip_octet: AtomicU32::new(2),
             server_keys,
             signing_key,
-            default_mask,
         }
     }
     

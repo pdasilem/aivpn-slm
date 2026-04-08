@@ -1080,6 +1080,11 @@ function setConnectionKey(value, qrSvg = '') {
   wrap.classList.toggle('has-key', Boolean(currentConnectionKey));
   wrap.classList.remove('popover-open');
   document.getElementById('connectionQr').innerHTML = qrSvg;
+  const popover = document.getElementById('connectionKeyPopover');
+  popover.style.display = '';
+  popover.style.visibility = '';
+  popover.style.left = '';
+  popover.style.top = '';
   document.getElementById('connectionKeyText').textContent = currentConnectionKey;
   document.getElementById('copyStatus').textContent = '';
   document.getElementById('decodedKey').textContent = decodeConnectionKey(value);
@@ -1097,7 +1102,8 @@ function showKeyPopover() {
   cancelHideKeyPopover();
   const qr = document.getElementById('connectionQr');
   const popover = document.getElementById('connectionKeyPopover');
-  document.getElementById('connectionKeyWrap').classList.add('popover-open');
+  popover.style.visibility = 'hidden';
+  popover.style.display = 'block';
   const qrRect = qr.getBoundingClientRect();
   const popoverRect = popover.getBoundingClientRect();
   const margin = 12;
@@ -1112,11 +1118,16 @@ function showKeyPopover() {
   if (top < margin) top = margin;
   popover.style.left = `${left}px`;
   popover.style.top = `${top}px`;
+  popover.style.visibility = '';
+  document.getElementById('connectionKeyWrap').classList.add('popover-open');
 }
 
 function hideKeyPopover() {
   cancelHideKeyPopover();
   document.getElementById('connectionKeyWrap').classList.remove('popover-open');
+  const popover = document.getElementById('connectionKeyPopover');
+  popover.style.display = '';
+  popover.style.visibility = '';
 }
 
 function scheduleHideKeyPopover() {
