@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,6 +50,10 @@ struct Args {
     /// Optional file used to load and persist the bearer token
     #[arg(long, env = "AIVPN_ADMIN_TOKEN_FILE")]
     token_file: Option<PathBuf>,
+
+    /// Host repository path used by the Admin Web update action
+    #[arg(long, default_value = "/opt/aivpn", env = "AIVPN_UPDATE_REPO_DIR")]
+    update_repo_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -123,6 +127,8 @@ fn route_request(request: &Request, state: &AppState) -> Response {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => Response::html(200, INDEX_HTML),
         ("GET", "/api/auth/status") => auth_status(state),
+        ("GET", "/api/update/status") => update_status(state),
+        ("POST", "/api/update/run") => run_update(state),
         ("POST", "/api/admin-token/generate") => generate_admin_token(state),
         ("GET", "/api/clients") => admin_json(&state.args, &["client", "list"]),
         ("POST", "/api/clients") => {
@@ -251,6 +257,158 @@ fn run_admin(args: &Args, admin_args: &[&str]) -> Result<String, String> {
     }
 
     String::from_utf8(output.stdout).map_err(|err| err.to_string())
+}
+
+fn run_capture(mut command: Command) -> Result<String, String> {
+    let output = command.output().map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("command exited with {}", output.status)
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_capture(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command
+        .arg("-c")
+        .arg(format!("safe.directory={}", repo.display()))
+        .arg("-C")
+        .arg(repo)
+        .args(args);
+    run_capture(command)
+}
+
+fn update_status(state: &AppState) -> Response {
+    let repo = &state.args.update_repo_dir;
+    if !repo.join(".git").exists() {
+        return Response::json(
+            500,
+            serde_json::json!({ "error": format!("git repository not found: {}", repo.display()) }),
+        );
+    }
+
+    let branch = match git_capture(repo, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(value) => value,
+        Err(err) => return Response::json(500, serde_json::json!({ "error": err })),
+    };
+    let mut upstream = git_capture(repo, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .unwrap_or_else(|_| format!("origin/{}", branch));
+    if upstream == "HEAD" {
+        upstream = format!("origin/{}", branch);
+    }
+    let remote_name = upstream.split('/').next().unwrap_or("origin");
+    let remote_url = git_capture(repo, &["remote", "get-url", remote_name]).unwrap_or_default();
+
+    if let Err(err) = git_capture(repo, &["fetch", "--prune"]) {
+        return Response::json(500, serde_json::json!({ "error": format!("git fetch failed: {}", err) }));
+    }
+
+    let local = match git_capture(repo, &["rev-parse", "HEAD"]) {
+        Ok(value) => value,
+        Err(err) => return Response::json(500, serde_json::json!({ "error": err })),
+    };
+    let remote = match git_capture(repo, &["rev-parse", &upstream]) {
+        Ok(value) => value,
+        Err(err) => return Response::json(500, serde_json::json!({ "error": err })),
+    };
+
+    Response::json(
+        200,
+        serde_json::json!({
+            "repo": repo,
+            "branch": branch,
+            "upstream": upstream,
+            "remoteUrl": remote_url,
+            "local": local,
+            "remote": remote,
+            "localShort": local.chars().take(12).collect::<String>(),
+            "remoteShort": remote.chars().take(12).collect::<String>(),
+            "upToDate": local == remote
+        }),
+    )
+}
+
+fn run_update(state: &AppState) -> Response {
+    let repo = &state.args.update_repo_dir;
+    if !repo.join(".git").exists() {
+        return Response::json(
+            500,
+            serde_json::json!({ "error": format!("git repository not found: {}", repo.display()) }),
+        );
+    }
+
+    let pull = {
+        let mut command = Command::new("git");
+        command
+            .arg("-c")
+            .arg(format!("safe.directory={}", repo.display()))
+            .arg("-C")
+            .arg(repo)
+            .args(["pull", "--ff-only"]);
+        run_capture(command)
+    };
+    let pull_output = match pull {
+        Ok(output) => output,
+        Err(err) => return Response::json(500, serde_json::json!({ "error": format!("git pull failed: {}", err) })),
+    };
+
+    let compose_output = run_compose_update(repo);
+    match compose_output {
+        Ok(output) => Response::json(
+            200,
+            serde_json::json!({
+                "message": "Update started. Services are being rebuilt and restarted.",
+                "restart_required": true,
+                "pull": pull_output,
+                "compose": output
+            }),
+        ),
+        Err(err) => Response::json(500, serde_json::json!({ "error": format!("docker compose update failed: {}", err), "pull": pull_output })),
+    }
+}
+
+fn run_compose_update(repo: &Path) -> Result<String, String> {
+    let services = ["aivpn-server", "aivpn-admin-web", "prometheus", "grafana"];
+    let compose_file = repo.join("docker-compose.yml");
+
+    let mut command = Command::new("docker");
+    command
+        .arg("compose")
+        .arg("-f")
+        .arg(&compose_file)
+        .arg("--project-directory")
+        .arg(repo)
+        .arg("up")
+        .arg("-d")
+        .arg("--build")
+        .args(services);
+
+    match run_capture(command) {
+        Ok(output) => Ok(output),
+        Err(err) => {
+            let mut fallback = Command::new("docker-compose");
+            fallback
+                .arg("-f")
+                .arg(&compose_file)
+                .arg("--project-directory")
+                .arg(repo)
+                .arg("up")
+                .arg("-d")
+                .arg("--build")
+                .args(services);
+            run_capture(fallback).map_err(|fallback_err| {
+                format!("docker compose: {}; docker-compose: {}", err, fallback_err)
+            })
+        }
+    }
 }
 
 fn parse_json_body(request: &Request) -> Result<Value, serde_json::Error> {
@@ -497,6 +655,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     code, textarea, pre { width: 100%; box-sizing: border-box; word-break: break-all; }
     pre { min-height: 96px; overflow: auto; white-space: pre-wrap; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .service-row { margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border); }
     .qr { display: flex; justify-content: center; padding: 12px; background: #fff; border-radius: 8px; margin-bottom: 12px; min-height: 64px; }
     .qr:empty { display: none; }
     .qr svg { max-width: 256px; width: 100%; height: auto; }
@@ -516,6 +675,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button onclick="clearToken()">Clear token</button>
       <button onclick="toggleTheme()">Toggle theme</button>
       <a id="grafanaLink" class="button-link" href="/grafana" target="_blank">Grafana</a>
+    </div>
+    <div class="row service-row">
+      <button onclick="openUpdateDialog()">Check for updates</button>
     </div>
     <div id="tokenStatus" class="muted"></div>
   </header>
@@ -545,6 +707,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <h2>Decoded key</h2>
     <pre id="decodedKey"></pre>
   </section>
+
+  <dialog id="updateDialog">
+    <h2>Update AIVPN</h2>
+    <pre id="updateStatus">Loading...</pre>
+    <div class="row">
+      <button id="runUpdateButton" onclick="runUpdate()" disabled>Update now</button>
+      <button onclick="document.getElementById('updateDialog').close()">Cancel</button>
+    </div>
+  </dialog>
 </main>
 <script>
 const tokenInput = document.getElementById('token');
@@ -579,6 +750,52 @@ async function generateToken() {
     localStorage.setItem('aivpnAdminToken', tokenInput.value);
     document.getElementById('tokenStatus').textContent = data.message || 'Admin token generated.';
   } catch (err) { showError(err); }
+}
+
+async function openUpdateDialog() {
+  const dialog = document.getElementById('updateDialog');
+  const status = document.getElementById('updateStatus');
+  const button = document.getElementById('runUpdateButton');
+  button.disabled = true;
+  status.textContent = 'Checking origin...';
+  dialog.showModal();
+  try {
+    const data = await api('/api/update/status');
+    status.textContent = [
+      `Repository: ${data.repo}`,
+      `Branch: ${data.branch}`,
+      `Upstream: ${data.upstream}`,
+      `Remote: ${data.remoteUrl || '-'}`,
+      `Current: ${data.localShort}`,
+      `Origin: ${data.remoteShort}`,
+      data.upToDate ? 'Status: up to date' : 'Status: update available'
+    ].join('\n');
+    button.disabled = data.upToDate;
+  } catch (err) {
+    status.textContent = `Update check failed: ${err.message || err}`;
+  }
+}
+
+async function runUpdate() {
+  if (!confirm('Update from origin and restart AIVPN services?')) return;
+  const status = document.getElementById('updateStatus');
+  const button = document.getElementById('runUpdateButton');
+  button.disabled = true;
+  status.textContent = 'Updating. The Admin UI may restart and this page may disconnect...';
+  try {
+    const data = await api('/api/update/run', {method: 'POST'});
+    status.textContent = [
+      data.message || 'Update completed.',
+      '',
+      'git pull:',
+      data.pull || '-',
+      '',
+      'docker compose:',
+      data.compose || '-'
+    ].join('\n');
+  } catch (err) {
+    status.textContent = `Update failed: ${err.message || err}`;
+  }
 }
 
 function clearToken() {

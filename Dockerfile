@@ -32,8 +32,11 @@ FROM debian:stable-slim
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    git \
     iptables \
     iproute2 \
+    docker-cli \
+    docker-compose \
     netcat-openbsd \
     bc \
     && rm -rf /var/lib/apt/lists/*

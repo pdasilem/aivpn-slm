@@ -110,6 +110,30 @@ detect_public_ip() {
   fi
 }
 
+read_env_value() {
+  local key="$1"
+  [ -f "$ENV_FILE" ] || return 0
+  grep -E "^${key}=" "$ENV_FILE" | tail -n 1 | cut -d= -f2-
+}
+
+endpoint_host() {
+  local endpoint="$1"
+  if printf '%s' "$endpoint" | grep -q '^\[.*\]:'; then
+    printf '%s' "$endpoint" | sed 's/^\[\(.*\)\]:.*$/\1/'
+  else
+    printf '%s' "$endpoint" | cut -d: -f1
+  fi
+}
+
+server_host_for_urls() {
+  local endpoint host
+  endpoint="$(read_env_value AIVPN_SERVER_IP)"
+  [ -n "$endpoint" ] || die "AIVPN_SERVER_IP is missing in ${ENV_FILE}. Install AIVPN or fix the configuration."
+  host="$(endpoint_host "$endpoint")"
+  [ -n "$host" ] || die "AIVPN_SERVER_IP is invalid in ${ENV_FILE}: ${endpoint}"
+  printf '%s' "$host"
+}
+
 detect_tailscale_ip() {
   if command -v tailscale >/dev/null 2>&1; then
     tailscale ip -4 2>/dev/null | head -n 1 || true
@@ -297,15 +321,16 @@ uninstall_aivpn() {
 }
 
 print_access_info() {
-  local token_state
+  local token_state host
   if grep -q '^AIVPN_ADMIN_TOKEN=' "$ENV_FILE" 2>/dev/null; then
     token_state="enabled"
   else
     token_state="disabled"
   fi
+  host="$(server_host_for_urls)"
 
-  printf '\nAdmin UI: http://<server-ip>:%s/\n' "$ADMIN_PORT"
-  printf 'Grafana: http://<server-ip>:3000/ (default login: admin / admin)\n'
+  printf '\nAdmin UI: http://%s:%s/\n' "$host" "$ADMIN_PORT"
+  printf 'Grafana: http://%s:3000/ (default login: admin / admin)\n' "$host"
   printf 'Admin token: %s\n' "$token_state"
   printf 'Metrics: http://127.0.0.1:9100/metrics or through Prometheus\n'
 }

@@ -60,10 +60,14 @@ services:
       - "${AIVPN_SERVER_IP:?Set AIVPN_SERVER_IP in .env, for example 5.152.13.186:443}"
       - "--token-file"
       - "/etc/aivpn/admin.token"
+      - "--update-repo-dir"
+      - "${PWD:-.}"
     environment:
       - AIVPN_ADMIN_TOKEN=${AIVPN_ADMIN_TOKEN:-}
     volumes:
       - ./config:/etc/aivpn
+      - .:${PWD:-/opt/aivpn}
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "27449:27449"
     labels:
