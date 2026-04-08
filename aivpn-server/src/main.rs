@@ -155,11 +155,24 @@ fn load_server_public_key(args: &ServerArgs) -> Option<[u8; 32]> {
     })
 }
 
-/// Build a connection key: aivpn://BASE64({"s":"host:port","k":"...","p":"...","i":"..."})
+fn load_server_signing_public_key(args: &ServerArgs) -> Option<[u8; 32]> {
+    args.key_file.as_ref().and_then(|key_file| {
+        let key_data = std::fs::read(key_file).ok()?;
+        if key_data.len() != 32 {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&key_data);
+        Some(crypto::derive_server_signing_public_key(&key))
+    })
+}
+
+/// Build a connection key: aivpn://BASE64({"s":"host:port","k":"...","g":"...","p":"...","i":"..."})
 fn build_connection_key(
     args: &ServerArgs,
     server_ip: &str,
     server_pub_b64: &str,
+    signing_pub_b64: &str,
     psk_b64: &str,
     vpn_ip: &str,
 ) -> String {
@@ -168,6 +181,7 @@ fn build_connection_key(
     let json = serde_json::json!({
         "s": server_addr,
         "k": server_pub_b64,
+        "g": signing_pub_b64,
         "p": psk_b64,
         "i": vpn_ip
     });
@@ -196,18 +210,23 @@ fn handle_add_client(db: &ClientDatabase, name: &str, args: &ServerArgs) {
             use base64::Engine;
             let psk_b64 = base64::engine::general_purpose::STANDARD.encode(&client.psk);
             let server_pub = load_server_public_key(args);
+            let signing_pub = load_server_signing_public_key(args);
 
             println!("✅ Client '{}' created!", name);
             println!("   ID:     {}", client.id);
             println!("   VPN IP: {}", client.vpn_ip);
             println!();
 
-            if let (Some(pub_key), Some(ref server_ip)) = (server_pub, &args.server_ip) {
+            if let (Some(pub_key), Some(signing_key), Some(ref server_ip)) =
+                (server_pub, signing_pub, &args.server_ip)
+            {
                 let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_key);
+                let signing_b64 = base64::engine::general_purpose::STANDARD.encode(&signing_key);
                 let conn_key = build_connection_key(
                     args,
                     server_ip,
                     &pub_b64,
+                    &signing_b64,
                     &psk_b64,
                     &client.vpn_ip.to_string(),
                 );
@@ -302,6 +321,7 @@ fn handle_show_client(db: &ClientDatabase, id: &str, args: &ServerArgs) {
             use base64::Engine;
             let psk_b64 = base64::engine::general_purpose::STANDARD.encode(&client.psk);
             let server_pub = load_server_public_key(args);
+            let signing_pub = load_server_signing_public_key(args);
 
             println!("Client: {} ({})", client.name, client.id);
             println!("  VPN IP:      {}", client.vpn_ip);
@@ -325,12 +345,16 @@ fn handle_show_client(db: &ClientDatabase, id: &str, args: &ServerArgs) {
                     .unwrap_or_else(|| "never".to_string())
             );
 
-            if let (Some(pub_key), Some(ref server_ip)) = (server_pub, &args.server_ip) {
+            if let (Some(pub_key), Some(signing_key), Some(ref server_ip)) =
+                (server_pub, signing_pub, &args.server_ip)
+            {
                 let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_key);
+                let signing_b64 = base64::engine::general_purpose::STANDARD.encode(&signing_key);
                 let conn_key = build_connection_key(
                     args,
                     server_ip,
                     &pub_b64,
+                    &signing_b64,
                     &psk_b64,
                     &client.vpn_ip.to_string(),
                 );
@@ -405,7 +429,7 @@ mod tests {
     #[test]
     fn build_connection_key_embeds_normalized_server_addr() {
         let args = test_args("0.0.0.0:443");
-        let key = build_connection_key(&args, "203.0.113.10:8443", "server-key", "psk", "10.0.0.2");
+        let key = build_connection_key(&args, "203.0.113.10:8443", "server-key", "signing-key", "psk", "10.0.0.2");
         let payload = key.strip_prefix("aivpn://").unwrap();
         let json_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
@@ -413,5 +437,6 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
 
         assert_eq!(json["s"], "203.0.113.10:8443");
+        assert_eq!(json["g"], "signing-key");
     }
 }

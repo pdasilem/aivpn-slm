@@ -23,7 +23,8 @@ object AivpnJni {
      * @param serverHost  Server hostname or IP.
      * @param serverPort  Server UDP port.
      * @param serverKey   32-byte server X25519 public key.
-     * @param psk         32-byte pre-shared key or `null`.
+     * @param psk         32-byte pre-shared key.
+     * @param serverSigningKey 32-byte server Ed25519 verifying key.
      * @return            Empty string on a clean rekey-triggered exit, error message otherwise.
      */
     external fun runTunnel(
@@ -32,7 +33,8 @@ object AivpnJni {
         serverHost: String,
         serverPort: Int,
         serverKey: ByteArray,
-        psk: ByteArray?,
+        psk: ByteArray,
+        serverSigningKey: ByteArray,
     ): String
 
     /**

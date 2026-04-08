@@ -320,7 +320,7 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("KeyRotate too short"));
                 }
                 let new_eph_pub_len = u16::from_le_bytes([data[2], data[3]]) as usize;
-                if data.len() < 4 + new_eph_pub_len {
+                if new_eph_pub_len != 32 || data.len() != 4 + new_eph_pub_len {
                     return Err(Error::InvalidPacket("KeyRotate invalid length"));
                 }
                 let mut new_eph_pub = [0u8; 32];

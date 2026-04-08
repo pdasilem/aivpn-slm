@@ -112,7 +112,7 @@ impl MaskCatalog {
     }
 
     /// Select the best non-compromised mask, excluding `current_mask_id`
-    pub fn select_fallback(&self, current_mask_id: &str) -> Option<MaskProfile> {
+    pub fn select_replacement(&self, current_mask_id: &str) -> Option<MaskProfile> {
         self.masks.iter()
             .filter(|e| e.key() != current_mask_id)
             .map(|e| e.value().clone())
@@ -152,20 +152,20 @@ pub struct Gateway {
 impl Gateway {
     pub fn new(config: GatewayConfig) -> Result<Self> {
         use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
-        use rand::rngs::OsRng;
-        use rand::RngCore;
-        
-        // Create server keypair (use config key if provided, otherwise generate ephemeral)
-        let server_keys = if config.server_private_key != [0u8; 32] {
-            crypto::KeyPair::from_private_key(config.server_private_key)
+        if config.server_private_key == [0u8; 32] {
+            return Err(Error::Session("server_private_key is required".into()));
+        }
+
+        let server_keys = crypto::KeyPair::from_private_key(config.server_private_key);
+
+        // Create stable Ed25519 signing key for ServerHello authentication.
+        let signing_key = if config.signing_key != [0u8; 64] {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&config.signing_key[..32]);
+            ed25519_dalek::SigningKey::from_bytes(&seed)
         } else {
-            crypto::KeyPair::generate()
+            crypto::derive_server_signing_key(&config.server_private_key)
         };
-        
-        // Create Ed25519 signing key
-        let mut key_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut key_bytes);
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
         
         // Create default mask
         let default_mask = webrtc_zoom_v3();
@@ -176,7 +176,7 @@ impl Gateway {
             default_mask,
         ));
         
-        // Initialize mask catalog (Patent 3 — fallback pool)
+        // Initialize mask catalog (Patent 3 — replacement pool)
         let mask_catalog = Arc::new(MaskCatalog::new());
         
         // Initialize neural resonance module (Patent 1)
@@ -271,6 +271,7 @@ impl Gateway {
             if let Some(tun_reader) = nat.take_reader().await {
                 let sessions = self.session_manager.clone();
                 let socket = self.udp_socket.as_ref().unwrap().clone();
+                let metrics = self.metrics.clone();
                 let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
                 let tun_addr = self.config.tun_addr.clone();
                 
@@ -288,7 +289,7 @@ impl Gateway {
                 });
                 
                 tokio::spawn(async move {
-                    Self::tun_read_loop(tun_reader, icmp_tx, sessions, socket, mask, tun_addr).await;
+                    Self::tun_read_loop(tun_reader, icmp_tx, sessions, socket, metrics, mask, tun_addr).await;
                 });
                 info!("TUN read loop spawned");
             }
@@ -297,10 +298,13 @@ impl Gateway {
         // Spawn periodic session cleanup task (remove expired/idle sessions)
         {
             let sessions = self.session_manager.clone();
+            let metrics = self.metrics.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     sessions.cleanup_expired();
+                    let count = sessions.session_count();
+                    metrics.update_session_count(count, count);
                 }
             });
             info!("Session cleanup task spawned (60s interval)");
@@ -386,8 +390,8 @@ impl Gateway {
                                 // Mark mask as compromised in catalog
                                 catalog.mark_compromised(mask_id);
                                 
-                                // Select fallback mask
-                                if let Some(new_mask) = catalog.select_fallback(mask_id) {
+                                // Select replacement mask
+                                if let Some(new_mask) = catalog.select_replacement(mask_id) {
                                     info!(
                                         "Auto-rotating to mask '{}' ({} masks remaining)",
                                         new_mask.mask_id,
@@ -399,7 +403,7 @@ impl Gateway {
                                     
                                     metrics.record_mask_rotation();
                                 } else {
-                                    error!("No fallback masks available! All masks compromised.");
+                                    error!("No replacement masks available. All masks compromised.");
                                 }
                             }
                             ResonanceStatus::Warning => {
@@ -427,7 +431,7 @@ impl Gateway {
                     metrics.record_dpi_attack();
                     catalog.mark_compromised(mask_id);
                     
-                    if let Some(new_mask) = catalog.select_fallback(mask_id) {
+                    if let Some(new_mask) = catalog.select_replacement(mask_id) {
                         info!(
                             "Anomaly-triggered rotation to mask '{}'",
                             new_mask.mask_id
@@ -446,6 +450,7 @@ impl Gateway {
         tun_writer: tokio::sync::mpsc::Sender<Vec<u8>>,
         sessions: Arc<SessionManager>,
         socket: Arc<UdpSocket>,
+        metrics: Arc<MetricsCollector>,
         mask: MaskProfile,
         tun_addr: String,
     ) {
@@ -540,8 +545,9 @@ impl Gateway {
                     aivpn_packet.extend_from_slice(&ciphertext);
                     
                     // Send to client
-                    if let Err(e) = socket.send_to(&aivpn_packet, client_addr).await {
-                        debug!("TUN: send failed: {}", e);
+                    match socket.send_to(&aivpn_packet, client_addr).await {
+                        Ok(sent) => metrics.record_packet_sent(sent),
+                        Err(e) => debug!("TUN: send failed: {}", e),
                     }
                 }
                 Err(e) => {
@@ -695,10 +701,12 @@ impl Gateway {
             // No session found — try handshake
             // Try to establish a new one from eph_pub in MDH
             if packet_data.len() < TAG_SIZE + mdh_len + 32 {
+                self.metrics.record_handshake_failure();
                 return Err(Error::InvalidPacket("Too short for session init"));
             }
             let eph_start = TAG_SIZE + mdh_len;
             if packet_data.len() < eph_start + 32 {
+                self.metrics.record_handshake_failure();
                 return Err(Error::InvalidPacket("Missing eph_pub for new session"));
             }
             let mut eph_pub = [0u8; 32];
@@ -707,54 +715,46 @@ impl Gateway {
             // Deobfuscate eph_pub (HIGH-9)
             crypto::obfuscate_eph_pub(&mut eph_pub, &self.session_manager.server_public_key());
             
-            // Try to create session with each registered client's PSK.
-            // If client_db is configured, iterate registered clients and try
-            // DH + PSK to find one whose derived tags match.
-            // Falls back to no-PSK for backward compatibility.
-            let (session, matched_client_id) = if let Some(ref db) = self.client_db {
-                let clients = db.list_clients();
-                let mut found = None;
-                for client_cfg in &clients {
-                    if !client_cfg.enabled { continue; }
-                    let psk = client_cfg.psk;
-                    match self.session_manager.create_session(
-                        client_addr,
-                        eph_pub,
-                        Some(psk),
-                        Some(client_cfg.vpn_ip),
-                    ) {
-                        Ok(sess) => {
-                            let validation = sess.lock().validate_tag(&tag);
-                            if validation.is_some() {
-                                found = Some((sess, Some(client_cfg.id.clone())));
-                                break;
-                            } else {
-                                // PSK mismatch — rollback this attempt
-                                let sid = sess.lock().session_id;
-                                self.session_manager.rollback_failed_session(&sid);
-                            }
-                        }
-                        Err(e) => {
-                            debug!("create_session failed: {}", e);
-                            continue;
-                        }
-                    }
-                }
-                match found {
-                    Some(f) => f,
-                    None => {
-                        return Err(Error::InvalidPacket("No registered client matches this handshake"));
-                    }
-                }
-            } else {
-                // No client DB — legacy mode without PSK
-                let sess = self.session_manager.create_session(
+            // Production requires a registered PSK-backed client.
+            let db = self.client_db.as_ref().ok_or_else(|| {
+                self.metrics.record_handshake_failure();
+                Error::InvalidPacket("Client database is required for handshake")
+            })?;
+            let clients = db.list_clients();
+            let mut found = None;
+            for client_cfg in &clients {
+                if !client_cfg.enabled { continue; }
+                let psk = client_cfg.psk;
+                match self.session_manager.create_session(
                     client_addr,
                     eph_pub,
-                    None,
-                    None,
-                )?;
-                (sess, None)
+                    Some(psk),
+                    Some(client_cfg.vpn_ip),
+                ) {
+                    Ok(sess) => {
+                        let validation = sess.lock().validate_tag(&tag);
+                        if validation.is_some() {
+                            found = Some((sess, Some(client_cfg.id.clone())));
+                            break;
+                        } else {
+                            // PSK mismatch — rollback this attempt
+                            let sid = sess.lock().session_id;
+                            self.session_manager.rollback_failed_session(&sid);
+                        }
+                    }
+                    Err(e) => {
+                        debug!("create_session failed: {}", e);
+                        continue;
+                    }
+                }
+            }
+            let (session, matched_client_id) = match found {
+                Some(f) => f,
+                None => {
+                    self.metrics.record_handshake_failure();
+                    self.metrics.record_psk_mismatch();
+                    return Err(Error::InvalidPacket("No registered client matches this handshake"));
+                }
             };
             
             // Validate the tag against the session.
@@ -767,6 +767,7 @@ impl Gateway {
                 None => {
                     let session_id = session.lock().session_id;
                     self.session_manager.rollback_failed_session(&session_id);
+                    self.metrics.record_handshake_failure();
                     return Err(Error::InvalidPacket("Tag mismatch on new session"));
                 }
             };
@@ -795,7 +796,10 @@ impl Gateway {
                     let sess = session.lock();
                     match (sess.server_eph_pub, sess.server_hello_signature) {
                         (Some(pub_key), Some(sig)) => (pub_key, sig),
-                        _ => return Err(Error::Session("Missing ratchet data".into())),
+                        _ => {
+                            self.metrics.record_handshake_failure();
+                            return Err(Error::Session("Missing ratchet data".into()));
+                        }
                     }
                 };
                 let hello = ControlPayload::ServerHello { server_eph_pub, signature };
@@ -809,6 +813,7 @@ impl Gateway {
                 let packet = self.build_packet(&inner_payload, &session)?;
                 let socket = self.udp_socket.as_ref().unwrap();
                 let sent = socket.send_to(&packet, client_addr).await?;
+                self.metrics.record_packet_sent(sent);
                 debug!("ServerHello sent: {} bytes to {}", sent, client_addr);
             }
             
@@ -817,6 +822,9 @@ impl Gateway {
             
             is_new_session = true;
             info!("New session from {} (ServerHello sent)", hash_addr(&client_addr));
+            self.metrics.record_handshake_success();
+            let session_count = self.session_manager.session_count();
+            self.metrics.update_session_count(session_count, session_count);
             (session, counter, is_ratcheted)
         };
         
@@ -844,7 +852,13 @@ impl Gateway {
             } else {
                 &sess.keys.session_key
             };
-            decrypt_payload(key, &nonce, encrypted_payload)?
+            match decrypt_payload(key, &nonce, encrypted_payload) {
+                Ok(plaintext) => plaintext,
+                Err(err) => {
+                    self.metrics.record_decrypt_failure();
+                    return Err(err);
+                }
+            }
         };
         
         // Complete PFS ratchet only when the CLIENT proves it has ratcheted
@@ -913,6 +927,8 @@ impl Gateway {
             self.session_manager.refresh_session_tags(&session_id);
         }
         
+        self.metrics.record_packet_received(packet_data.len());
+
         // Record traffic stats for neural resonance (Patent 1)
         if self.config.enable_neural {
             let packet_size = packet_data.len() as u16;
@@ -927,7 +943,6 @@ impl Gateway {
                     session_id, packet_size, iat_ms, entropy,
                 );
             }
-            self.metrics.record_packet_received(packet_data.len());
         }
         
         // Record traffic in client DB in batches (see pending_bytes_in above).
@@ -971,7 +986,10 @@ impl Gateway {
                 debug!("DATA packet from {} ({} bytes)", hash_addr(&client_addr), payload.len());
                 
                 if let Some(ref nat) = self.nat_forwarder {
-                    nat.forward_packet(payload).await?;
+                    if let Err(err) = nat.forward_packet(payload).await {
+                        self.metrics.record_nat_forward_failure();
+                        return Err(err);
+                    }
                 } else {
                     debug!("NAT disabled, dropping packet");
                 }
@@ -980,8 +998,7 @@ impl Gateway {
                 self.handle_control_message(payload, session, client_addr).await?;
             }
             InnerType::Fragment => {
-                // TODO: Implement fragmentation
-                debug!("FRAGMENT packet (not implemented)");
+                return Err(Error::InvalidPacket("Fragment packets are not implemented"));
             }
             InnerType::Ack => {
                 // Handle ACK
@@ -1004,7 +1021,12 @@ impl Gateway {
         match control {
             ControlPayload::KeyRotate { new_eph_pub } => {
                 info!("Key rotation request from {}", hash_addr(&client_addr));
-                // TODO: Implement key rotation
+                let session_id = session.lock().session_id;
+                let hello = self.session_manager.prepare_session_key_rotation(
+                    &session_id,
+                    new_eph_pub,
+                )?;
+                self.send_control_message(&hello, session).await?;
             }
             ControlPayload::MaskUpdate { .. } => {
                 warn!("Unexpected MASK_UPDATE from client");
@@ -1040,6 +1062,8 @@ impl Gateway {
                 // Close session
                 let session_id = session.lock().session_id;
                 self.session_manager.remove_session(&session_id);
+                let session_count = self.session_manager.session_count();
+                self.metrics.update_session_count(session_count, session_count);
             }
             ControlPayload::ControlAck { .. } => {
                 // ACK received, nothing to do
@@ -1066,7 +1090,8 @@ impl Gateway {
         // Extract client_addr before dropping the guard to avoid holding
         // MutexGuard across .await (which would cause deadlock)
         let client_addr = session.lock().client_addr;
-        socket.send_to(&packet, client_addr).await?;
+        let sent = socket.send_to(&packet, client_addr).await?;
+        self.metrics.record_packet_sent(sent);
         
         Ok(())
     }

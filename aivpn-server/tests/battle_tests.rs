@@ -1089,20 +1089,20 @@ fn test_mask_catalog_compromised() {
 }
 
 #[test]
-fn test_mask_catalog_select_fallback() {
+fn test_mask_catalog_select_replacement() {
     let catalog = MaskCatalog::new();
-    let fallback = catalog.select_fallback("webrtc_zoom_v3");
-    assert!(fallback.is_some(), "Must have a fallback mask");
-    assert_eq!(fallback.unwrap().mask_id, "quic_https_v2", "Fallback must be the other mask");
+    let replacement = catalog.select_replacement("webrtc_zoom_v3");
+    assert!(replacement.is_some(), "Must have a replacement mask");
+    assert_eq!(replacement.unwrap().mask_id, "quic_https_v2", "Replacement must be the other mask");
 }
 
 #[test]
-fn test_mask_catalog_no_fallback_when_all_compromised() {
+fn test_mask_catalog_no_replacement_when_all_compromised() {
     let catalog = MaskCatalog::new();
     catalog.mark_compromised("webrtc_zoom_v3");
     catalog.mark_compromised("quic_https_v2");
-    let fallback = catalog.select_fallback("anything");
-    assert!(fallback.is_none(), "No fallback when all masks compromised");
+    let replacement = catalog.select_replacement("anything");
+    assert!(replacement.is_none(), "No replacement when all masks compromised");
     assert_eq!(catalog.available_count(), 0);
 }
 

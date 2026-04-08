@@ -11,6 +11,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce, Key as ChachaKey,
 };
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::Hmac;
 use rand::RngCore;
 use sha2::Sha256;
@@ -45,6 +46,7 @@ pub const DEFAULT_WINDOW_MS: u64 = 10_000;
 const HKDF_SESSION_KEY_CONTEXT: &str = "aivpn-session-key-v1";
 const HKDF_TAG_SECRET_CONTEXT: &str = "aivpn-tag-secret-v1";
 const HKDF_PRNG_SEED_CONTEXT: &str = "aivpn-prng-seed-v1";
+const SERVER_SIGNING_KEY_CONTEXT: &str = "aivpn-server-signing-key-v1";
 
 /// Session keys derived from key exchange
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -228,6 +230,55 @@ pub fn obfuscate_eph_pub(eph_pub: &mut [u8; 32], server_static_pub: &[u8; 32]) {
     }
 }
 
+/// Derive a stable Ed25519 signing key from the server's X25519 private key.
+///
+/// This keeps ServerHello authentication stable across restarts without adding a
+/// second key file. The derivation uses a separate BLAKE3 context and must never
+/// reuse raw X25519 private bytes directly as an Ed25519 seed.
+pub fn derive_server_signing_key(server_private_key: &[u8; X25519_PRIVATE_KEY_SIZE]) -> SigningKey {
+    let seed = blake3::derive_key(SERVER_SIGNING_KEY_CONTEXT, server_private_key);
+    SigningKey::from_bytes(&seed)
+}
+
+/// Derive the public Ed25519 verifying key embedded into connection keys.
+pub fn derive_server_signing_public_key(
+    server_private_key: &[u8; X25519_PRIVATE_KEY_SIZE],
+) -> [u8; 32] {
+    derive_server_signing_key(server_private_key)
+        .verifying_key()
+        .to_bytes()
+}
+
+/// Sign ServerHello ratchet material: server_eph_pub || client_eph_pub.
+pub fn sign_server_hello(
+    signing_key: &SigningKey,
+    server_eph_pub: &[u8; X25519_PUBLIC_KEY_SIZE],
+    client_eph_pub: &[u8; X25519_PUBLIC_KEY_SIZE],
+) -> [u8; 64] {
+    let mut message = [0u8; 64];
+    message[..32].copy_from_slice(server_eph_pub);
+    message[32..].copy_from_slice(client_eph_pub);
+    signing_key.sign(&message).to_bytes()
+}
+
+/// Verify ServerHello signature over server_eph_pub || client_eph_pub.
+pub fn verify_server_hello_signature(
+    signing_pub: &[u8; 32],
+    server_eph_pub: &[u8; X25519_PUBLIC_KEY_SIZE],
+    client_eph_pub: &[u8; X25519_PUBLIC_KEY_SIZE],
+    signature: &[u8; 64],
+) -> Result<()> {
+    let verifying_key = VerifyingKey::from_bytes(signing_pub)
+        .map_err(|e| Error::Crypto(format!("Invalid server signing key: {}", e)))?;
+    let signature = Signature::from_bytes(signature);
+    let mut message = [0u8; 64];
+    message[..32].copy_from_slice(server_eph_pub);
+    message[32..].copy_from_slice(client_eph_pub);
+    verifying_key
+        .verify(&message, &signature)
+        .map_err(|_| Error::Crypto("ServerHello signature verification failed".into()))
+}
+
 /// Compute HMAC-SHA256
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     use hmac::Mac;
@@ -275,5 +326,31 @@ mod tests {
 
         assert_ne!(tag1, tag2); // Different counter
         assert_eq!(tag1, tag3); // Same counter and window
+    }
+
+    #[test]
+    fn test_server_hello_signature_verification() {
+        let server_private = [9u8; X25519_PRIVATE_KEY_SIZE];
+        let signing_key = derive_server_signing_key(&server_private);
+        let signing_pub = derive_server_signing_public_key(&server_private);
+        let server_eph = [1u8; X25519_PUBLIC_KEY_SIZE];
+        let client_eph = [2u8; X25519_PUBLIC_KEY_SIZE];
+
+        let signature = sign_server_hello(&signing_key, &server_eph, &client_eph);
+
+        verify_server_hello_signature(&signing_pub, &server_eph, &client_eph, &signature)
+            .unwrap();
+
+        let mut tampered_server_eph = server_eph;
+        tampered_server_eph[0] ^= 1;
+        assert!(
+            verify_server_hello_signature(
+                &signing_pub,
+                &tampered_server_eph,
+                &client_eph,
+                &signature,
+            )
+            .is_err()
+        );
     }
 }

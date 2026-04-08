@@ -31,7 +31,8 @@ use jni::JNIEnv;
 ///     serverHost: String,
 ///     serverPort: Int,
 ///     serverKey: ByteArray, // 32 bytes
-///     psk: ByteArray?,      // 32 bytes or null
+///     psk: ByteArray,      // 32 bytes
+///     serverSigningKey: ByteArray, // 32-byte Ed25519 verifying key
 /// ): String               // "" on clean exit, error message otherwise
 /// ```
 #[no_mangle]
@@ -43,7 +44,8 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
     server_host: JString<'local>,
     server_port: jint,
     server_key_arr: JByteArray<'local>,
-    psk_obj: JObject<'local>, // nullable JByteArray
+    psk_obj: JObject<'local>, // JByteArray
+    signing_obj: JObject<'local>, // JByteArray
 ) -> jstring {
     // ── Unpack arguments ──
     let host = match env.get_string(&server_host) {
@@ -61,18 +63,35 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
         Err(e) => return make_str(&mut env, &format!("bad server_key: {e}")),
     };
 
-    let psk: Option<[u8; 32]> = if psk_obj.is_null() {
-        None
-    } else {
+    if psk_obj.is_null() {
+        return make_str(&mut env, "psk is required");
+    }
+    let psk: [u8; 32] = {
         let arr: JByteArray<'local> = unsafe { JByteArray::from_raw(psk_obj.as_raw()) };
         match env.convert_byte_array(&arr) {
             Ok(b) if b.len() == 32 => {
                 let mut out = [0u8; 32];
                 out.copy_from_slice(&b);
-                Some(out)
+                out
             }
             Ok(b) => return make_str(&mut env, &format!("psk must be 32 bytes, got {}", b.len())),
             Err(e) => return make_str(&mut env, &format!("bad psk: {e}")),
+        }
+    };
+
+    if signing_obj.is_null() {
+        return make_str(&mut env, "server_signing_key is required");
+    }
+    let server_signing_pub: [u8; 32] = {
+        let arr: JByteArray<'local> = unsafe { JByteArray::from_raw(signing_obj.as_raw()) };
+        match env.convert_byte_array(&arr) {
+            Ok(b) if b.len() == 32 => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&b);
+                out
+            }
+            Ok(b) => return make_str(&mut env, &format!("server_signing_key must be 32 bytes, got {}", b.len())),
+            Err(e) => return make_str(&mut env, &format!("bad server_signing_key: {e}")),
         }
     };
 
@@ -103,6 +122,7 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
         server_port as u16,
         key_bytes,
         psk,
+        server_signing_pub,
     ));
 
     match result {

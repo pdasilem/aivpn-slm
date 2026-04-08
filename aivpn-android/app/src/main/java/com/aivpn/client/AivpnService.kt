@@ -1,3 +1,5 @@
+@file:Suppress("DEPRECATION")
+
 package com.aivpn.client
 
 import android.app.Notification
@@ -54,6 +56,7 @@ class AivpnService : VpnService() {
     // Saved params for reconnect
     @Volatile private var savedServerAddr: String? = null
     @Volatile private var savedServerKey: String?  = null
+    @Volatile private var savedServerSigningKey: String? = null
     @Volatile private var savedPsk: String?        = null
     @Volatile private var savedVpnIp: String?      = null
 
@@ -78,8 +81,11 @@ class AivpnService : VpnService() {
             ACTION_CONNECT -> {
                 val server    = intent.getStringExtra("server")     ?: return START_NOT_STICKY
                 val serverKey = intent.getStringExtra("server_key") ?: return START_NOT_STICKY
+                val serverSigningKey = intent.getStringExtra("server_signing_key") ?: return START_NOT_STICKY
+                val psk = intent.getStringExtra("psk") ?: return START_NOT_STICKY
                 startVpn(server, serverKey,
-                    intent.getStringExtra("psk"),
+                    serverSigningKey,
+                    psk,
                     intent.getStringExtra("vpn_ip"))
             }
             ACTION_DISCONNECT -> stopVpn()
@@ -90,12 +96,14 @@ class AivpnService : VpnService() {
     private fun startVpn(
         serverAddr: String,
         serverKeyBase64: String,
-        pskBase64: String? = null,
+        serverSigningKeyBase64: String,
+        pskBase64: String,
         vpnIp: String? = null,
     ) {
         Log.d(TAG, "startVpn: server=$serverAddr")
         savedServerAddr  = serverAddr
         savedServerKey   = serverKeyBase64
+        savedServerSigningKey = serverSigningKeyBase64
         savedPsk         = pskBase64
         savedVpnIp       = vpnIp
         manualDisconnect = false
@@ -186,10 +194,15 @@ class AivpnService : VpnService() {
             android.util.Base64.DEFAULT)
         if (serverKey.size != 32) throw Exception("Invalid server key size: ${serverKey.size}")
 
-        val psk: ByteArray? = savedPsk?.let {
-            val decoded = android.util.Base64.decode(it, android.util.Base64.DEFAULT)
-            if (decoded.size == 32) decoded else null
-        }
+        val serverSigningKey = android.util.Base64.decode(
+            savedServerSigningKey ?: throw Exception("No server signing key"),
+            android.util.Base64.DEFAULT)
+        if (serverSigningKey.size != 32) throw Exception("Invalid server signing key size: ${serverSigningKey.size}")
+
+        val psk = android.util.Base64.decode(
+            savedPsk ?: throw Exception("No PSK"),
+            android.util.Base64.DEFAULT)
+        if (psk.size != 32) throw Exception("Invalid PSK size: ${psk.size}")
 
         val tunAddress4 = savedVpnIp ?: "10.0.0.2"
 
@@ -272,7 +285,7 @@ class AivpnService : VpnService() {
 
         try {
             val error = withContext(Dispatchers.IO) {
-                AivpnJni.runTunnel(this@AivpnService, tunFd, host, port, serverKey, psk)
+                AivpnJni.runTunnel(this@AivpnService, tunFd, host, port, serverKey, psk, serverSigningKey)
             }
             if (error.isNotEmpty()) throw RuntimeException(error)
         } finally {
@@ -434,7 +447,7 @@ class AivpnService : VpnService() {
 
             if (hasUsableActiveNetwork) return
 
-            // Fallback: when VPN is active, activeNetwork can point to TRANSPORT_VPN.
+            // When VPN is active, activeNetwork can point to TRANSPORT_VPN.
             // In that case, scan all networks for any non-VPN internet-capable network.
             val hasAnyUsableNetwork = cm.allNetworks.any { net ->
                 val netCaps = cm.getNetworkCapabilities(net) ?: return@any false

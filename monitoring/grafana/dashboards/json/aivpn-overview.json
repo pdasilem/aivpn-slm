@@ -76,7 +76,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "aivpn_sessions_active",
+          "expr": "aivpn_sessions_active or vector(0)",
           "refId": "A"
         }
       ],
@@ -119,7 +119,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "rate(aivpn_bytes_received_total[1m])",
+          "expr": "rate(aivpn_bytes_received_total[5m]) or vector(0)",
           "legendFormat": "received",
           "refId": "A"
         },
@@ -128,7 +128,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "rate(aivpn_bytes_sent_total[1m])",
+          "expr": "rate(aivpn_bytes_sent_total[5m]) or vector(0)",
           "legendFormat": "sent",
           "refId": "B"
         }
@@ -170,7 +170,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "increase(aivpn_mask_rotations_total[5m])",
+          "expr": "increase(aivpn_mask_rotations_total[5m]) or vector(0)",
           "legendFormat": "mask rotations",
           "refId": "A"
         },
@@ -179,7 +179,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "increase(aivpn_key_rotations_total[5m])",
+          "expr": "increase(aivpn_key_rotations_total[5m]) or vector(0)",
           "legendFormat": "key rotations",
           "refId": "B"
         },
@@ -188,9 +188,45 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "increase(aivpn_dpi_attacks_detected_total[5m])",
+          "expr": "increase(aivpn_dpi_attacks_detected_total[5m]) or vector(0)",
           "legendFormat": "DPI attacks",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "expr": "increase(aivpn_handshakes_failed_total[5m]) or vector(0)",
+          "legendFormat": "handshake failures",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "expr": "increase(aivpn_psk_mismatches_total[5m]) or vector(0)",
+          "legendFormat": "PSK mismatches",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "expr": "increase(aivpn_decrypt_failures_total[5m]) or vector(0)",
+          "legendFormat": "decrypt failures",
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "expr": "increase(aivpn_nat_forward_failures_total[5m]) or vector(0)",
+          "legendFormat": "NAT forward failures",
+          "refId": "G"
         }
       ],
       "title": "Security Events",

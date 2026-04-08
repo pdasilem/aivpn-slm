@@ -1,7 +1,10 @@
+@file:Suppress("DEPRECATION")
+
 package com.aivpn.client
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.core.content.edit
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import org.json.JSONArray
@@ -30,7 +33,7 @@ object SecureStorage {
     }
 
     fun saveString(context: Context, key: String, value: String) {
-        getPrefs(context).edit().putString(key, value).apply()
+        getPrefs(context).edit { putString(key, value) }
     }
 
     fun loadString(context: Context, key: String, defaultValue: String = ""): String {
@@ -42,16 +45,7 @@ object SecureStorage {
     }
 
     fun remove(context: Context, key: String) {
-        getPrefs(context).edit().remove(key).apply()
-    }
-
-    // Connection key helpers (legacy single-key, kept for migration)
-    fun saveConnectionKey(context: Context, key: String) {
-        saveString(context, "connection_key", key)
-    }
-
-    fun loadConnectionKey(context: Context): String {
-        return loadString(context, "connection_key")
+        getPrefs(context).edit { remove(key) }
     }
 
     // Theme preference

@@ -23,6 +23,14 @@ pub struct ClientArgs {
     #[arg(long)]
     pub server_key: Option<String>,
 
+    /// Server signing public key (base64, 32 bytes)
+    #[arg(long)]
+    pub server_signing_key: Option<String>,
+
+    /// Client PSK (base64, 32 bytes)
+    #[arg(long)]
+    pub psk: Option<String>,
+
     /// Connection key (aivpn://...) — contains server, key, PSK, VPN IP
     #[arg(short = 'k', long)]
     pub connection_key: Option<String>,
@@ -71,7 +79,7 @@ async fn main() {
     let args = ClientArgs::parse();
     
     // Parse connection key or individual args
-    let (server_addr, server_key_b64, psk_bytes, tun_addr) = if let Some(ref conn_key) = args.connection_key {
+    let (server_addr, server_key_b64, server_signing_b64, psk_b64, tun_addr) = if let Some(ref conn_key) = args.connection_key {
         let payload = conn_key.trim().strip_prefix("aivpn://").unwrap_or(conn_key.trim());
         let json_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
@@ -92,21 +100,37 @@ async fn main() {
             error!("Connection key missing server key (\"k\")");
             std::process::exit(1);
         }).to_string();
-        let psk: Option<Vec<u8>> = json["p"].as_str().and_then(|p| {
-            base64::engine::general_purpose::STANDARD.decode(p).ok()
-        });
-        let ip = json["i"].as_str().map(|i| i.to_string());
-        (s, k, psk, ip.unwrap_or_else(|| args.tun_addr.clone()))
+        let psk = json["p"].as_str().unwrap_or_else(|| {
+            error!("Connection key missing PSK (\"p\")");
+            std::process::exit(1);
+        }).to_string();
+        let ip = json["i"].as_str().unwrap_or_else(|| {
+            error!("Connection key missing VPN IP (\"i\")");
+            std::process::exit(1);
+        }).to_string();
+        let g = json["g"].as_str().unwrap_or_else(|| {
+            error!("Connection key missing server signing key (\"g\")");
+            std::process::exit(1);
+        }).to_string();
+        (s, k, g, psk, ip)
     } else {
         let server = args.server.clone().unwrap_or_else(|| {
-            error!("Either --connection-key or --server + --server-key required");
+            error!("Either --connection-key or --server + --server-key + --server-signing-key + --psk required");
             std::process::exit(1);
         });
         let key = args.server_key.clone().unwrap_or_else(|| {
-            error!("Either --connection-key or --server + --server-key required");
+            error!("Either --connection-key or --server + --server-key + --server-signing-key + --psk required");
             std::process::exit(1);
         });
-        (server, key, None, args.tun_addr.clone())
+        let signing_key = args.server_signing_key.clone().unwrap_or_else(|| {
+            error!("Either --connection-key or --server + --server-key + --server-signing-key + --psk required");
+            std::process::exit(1);
+        });
+        let psk = args.psk.clone().unwrap_or_else(|| {
+            error!("Either --connection-key or --server + --server-key + --server-signing-key + --psk required");
+            std::process::exit(1);
+        });
+        (server, key, signing_key, psk, args.tun_addr.clone())
     };
     
     info!("AIVPN Client v{}", env!("CARGO_PKG_VERSION"));
@@ -127,16 +151,32 @@ async fn main() {
     }
     server_public_key.copy_from_slice(&server_key_decoded);
 
+    let server_signing_decoded = base64::engine::general_purpose::STANDARD
+        .decode(server_signing_b64)
+        .unwrap_or_else(|e| {
+            error!("Invalid server signing key: {}", e);
+            std::process::exit(1);
+        });
+    if server_signing_decoded.len() != 32 {
+        error!("Server signing key must be 32 bytes, got {}", server_signing_decoded.len());
+        std::process::exit(1);
+    }
+    let mut server_signing_pub = [0u8; 32];
+    server_signing_pub.copy_from_slice(&server_signing_decoded);
+
     // Parse PSK
-    let preshared_key: Option<[u8; 32]> = psk_bytes.and_then(|v| {
-        if v.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&v);
-            Some(arr)
-        } else {
-            None
-        }
-    });
+    let psk_decoded = base64::engine::general_purpose::STANDARD
+        .decode(psk_b64)
+        .unwrap_or_else(|e| {
+            error!("Invalid PSK: {}", e);
+            std::process::exit(1);
+        });
+    if psk_decoded.len() != 32 {
+        error!("PSK must be 32 bytes, got {}", psk_decoded.len());
+        std::process::exit(1);
+    }
+    let mut preshared_key = [0u8; 32];
+    preshared_key.copy_from_slice(&psk_decoded);
     
     let tun_name_fixed = args.tun_name.clone();
     let full_tunnel = args.full_tunnel;
@@ -163,7 +203,7 @@ async fn main() {
             server_public_key,
             preshared_key,
             initial_mask: webrtc_zoom_v3(),
-            server_signing_pub: None,
+            server_signing_pub,
             tun_config: TunnelConfig {
                 tun_name: tun_name.clone(),
                 tun_addr: tun_addr.clone(),

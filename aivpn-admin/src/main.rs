@@ -226,12 +226,15 @@ fn build_connection_key_for_client(client: &ClientConfig, args: &Args) -> Result
 
     let server_pub = load_server_public_key(key_file)?;
     let pub_b64 = base64::engine::general_purpose::STANDARD.encode(server_pub);
+    let signing_pub = load_server_signing_public_key(key_file)?;
+    let signing_b64 = base64::engine::general_purpose::STANDARD.encode(signing_pub);
     let psk_b64 = base64::engine::general_purpose::STANDARD.encode(client.psk);
     let server_addr = build_connection_server_addr(&args.listen, server_ip);
 
     let json = serde_json::json!({
         "s": server_addr,
         "k": pub_b64,
+        "g": signing_b64,
         "p": psk_b64,
         "i": client.vpn_ip.to_string(),
     });
@@ -254,6 +257,19 @@ fn load_server_public_key(key_file: &Path) -> Result<[u8; 32]> {
     key.copy_from_slice(&key_data);
     let kp = crypto::KeyPair::from_private_key(key);
     Ok(kp.public_key_bytes())
+}
+
+fn load_server_signing_public_key(key_file: &Path) -> Result<[u8; 32]> {
+    let key_data = std::fs::read(key_file)?;
+    if key_data.len() != 32 {
+        return Err(Error::Session(format!(
+            "Key file must be exactly 32 bytes, got {}",
+            key_data.len()
+        )));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_data);
+    Ok(crypto::derive_server_signing_public_key(&key))
 }
 
 fn build_connection_server_addr(listen: &str, server_ip: &str) -> String {
@@ -450,6 +466,7 @@ mod tests {
         assert_eq!(json["s"], "203.0.113.10:8443");
         assert_eq!(json["i"], client.vpn_ip.to_string());
         assert!(json["k"].as_str().unwrap().len() > 10);
+        assert!(json["g"].as_str().unwrap().len() > 10);
         assert!(json["p"].as_str().unwrap().len() > 10);
     }
 }

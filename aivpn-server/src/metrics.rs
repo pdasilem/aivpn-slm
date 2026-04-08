@@ -40,6 +40,21 @@ pub struct MetricsCollector {
     packets_sent: Counter,
 
     #[cfg(feature = "metrics")]
+    handshakes_success: Counter,
+
+    #[cfg(feature = "metrics")]
+    handshakes_failed: Counter,
+
+    #[cfg(feature = "metrics")]
+    psk_mismatches: Counter,
+
+    #[cfg(feature = "metrics")]
+    decrypt_failures: Counter,
+
+    #[cfg(feature = "metrics")]
+    nat_forward_failures: Counter,
+
+    #[cfg(feature = "metrics")]
     bytes_received: Counter,
 
     #[cfg(feature = "metrics")]
@@ -105,6 +120,52 @@ impl MetricsCollector {
                 Counter::with_opts(Opts::new("aivpn_packets_sent_total", "Total packets sent"))
                     .unwrap();
             registry.register(Box::new(packets_sent.clone())).unwrap();
+
+            // Handshake and error metrics
+            let handshakes_success = Counter::with_opts(Opts::new(
+                "aivpn_handshakes_success_total",
+                "Total successful handshakes",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(handshakes_success.clone()))
+                .unwrap();
+
+            let handshakes_failed = Counter::with_opts(Opts::new(
+                "aivpn_handshakes_failed_total",
+                "Total failed handshakes",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(handshakes_failed.clone()))
+                .unwrap();
+
+            let psk_mismatches = Counter::with_opts(Opts::new(
+                "aivpn_psk_mismatches_total",
+                "Total handshakes rejected because no client PSK matched",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(psk_mismatches.clone()))
+                .unwrap();
+
+            let decrypt_failures = Counter::with_opts(Opts::new(
+                "aivpn_decrypt_failures_total",
+                "Total payload decrypt failures",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(decrypt_failures.clone()))
+                .unwrap();
+
+            let nat_forward_failures = Counter::with_opts(Opts::new(
+                "aivpn_nat_forward_failures_total",
+                "Total NAT forward failures",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(nat_forward_failures.clone()))
+                .unwrap();
 
             // Bandwidth metrics
             let bytes_received = Counter::with_opts(Opts::new(
@@ -188,6 +249,11 @@ impl MetricsCollector {
                 sessions_active,
                 packets_received,
                 packets_sent,
+                handshakes_success,
+                handshakes_failed,
+                psk_mismatches,
+                decrypt_failures,
+                nat_forward_failures,
                 bytes_received,
                 bytes_sent,
                 packet_processing_time,
@@ -228,6 +294,46 @@ impl MetricsCollector {
         {
             self.packets_sent.inc();
             self.bytes_sent.inc_by(_bytes as f64);
+        }
+    }
+
+    /// Record successful handshake
+    pub fn record_handshake_success(&self) {
+        #[cfg(feature = "metrics")]
+        {
+            self.handshakes_success.inc();
+        }
+    }
+
+    /// Record failed handshake
+    pub fn record_handshake_failure(&self) {
+        #[cfg(feature = "metrics")]
+        {
+            self.handshakes_failed.inc();
+        }
+    }
+
+    /// Record PSK mismatch
+    pub fn record_psk_mismatch(&self) {
+        #[cfg(feature = "metrics")]
+        {
+            self.psk_mismatches.inc();
+        }
+    }
+
+    /// Record decrypt failure
+    pub fn record_decrypt_failure(&self) {
+        #[cfg(feature = "metrics")]
+        {
+            self.decrypt_failures.inc();
+        }
+    }
+
+    /// Record NAT forward failure
+    pub fn record_nat_forward_failure(&self) {
+        #[cfg(feature = "metrics")]
+        {
+            self.nat_forward_failures.inc();
         }
     }
 
@@ -371,6 +477,8 @@ mod tests {
         collector.update_session_count(2, 1);
         collector.record_packet_received(128);
         collector.record_packet_sent(64);
+        collector.record_handshake_success();
+        collector.record_decrypt_failure();
         collector.record_mask_rotation();
 
         let metrics = collector.gather();
@@ -378,6 +486,8 @@ mod tests {
         assert!(metrics.contains("aivpn_sessions_active"));
         assert!(metrics.contains("aivpn_packets_received_total"));
         assert!(metrics.contains("aivpn_bytes_sent_total"));
+        assert!(metrics.contains("aivpn_handshakes_success_total"));
+        assert!(metrics.contains("aivpn_decrypt_failures_total"));
         assert!(metrics.contains("aivpn_mask_rotations_total"));
     }
 }

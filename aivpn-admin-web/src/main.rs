@@ -1105,6 +1105,7 @@ function decodeConnectionKey(value) {
     return JSON.stringify({
       server: decoded.s || null,
       serverPublicKey: decoded.k || null,
+      serverSigningPublicKey: decoded.g || null,
       presharedKey: decoded.p || null,
       vpnIp: decoded.i || null,
       raw: decoded

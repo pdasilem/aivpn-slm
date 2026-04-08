@@ -332,7 +332,7 @@ Full tunnel:
 2. Paste your **connection key** (`aivpn://...`) into the single input field
 3. Tap **Connect**
 
-The connection key contains everything: server address, public key, your PSK, and VPN IP. No manual configuration needed.
+The connection key contains everything: server address, server public keys, your PSK, and VPN IP. No manual configuration needed.
 
 ## Cross-compilation
 

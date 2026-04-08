@@ -47,6 +47,8 @@ pub trait PacketEncryptor: Send {
     fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>>;
     /// Encrypt a keepalive control message into a ready-to-send UDP datagram.
     fn encrypt_keepalive(&mut self) -> Result<Vec<u8>>;
+    /// Encrypt an arbitrary control message into a ready-to-send UDP datagram.
+    fn encrypt_control(&mut self, control: &ControlPayload) -> Result<Vec<u8>>;
     /// Called after a data datagram has been successfully sent.
     /// Use this for stats tracking, FSM transitions, etc.
     fn on_data_sent(&mut self, payload_len: usize);
@@ -76,8 +78,12 @@ impl PacketEncryptor for ZeroMdhEncryptor {
     }
 
     fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
-        let keepalive = ControlPayload::Keepalive.encode()?;
-        let inner = build_inner_packet(InnerType::Control, self.seq, &keepalive);
+        self.encrypt_control(&ControlPayload::Keepalive)
+    }
+
+    fn encrypt_control(&mut self, control: &ControlPayload) -> Result<Vec<u8>> {
+        let encoded = control.encode()?;
+        let inner = build_inner_packet(InnerType::Control, self.seq, &encoded);
         self.seq = self.seq.wrapping_add(1);
         build_zero_mdh_packet(&self.keys, &mut self.counter, &inner, None)
     }
@@ -119,6 +125,7 @@ async fn send_tolerant(udp: &UdpSocket, data: &[u8]) -> Result<()> {
 /// caller is expected to `.abort()` the task when the session ends.
 pub async fn run_upload_loop(
     rx: &mut mpsc::Receiver<Vec<u8>>,
+    control_rx: &mut mpsc::Receiver<ControlPayload>,
     udp: &Arc<UdpSocket>,
     enc: &mut impl PacketEncryptor,
     config: &UploadConfig,
@@ -129,6 +136,17 @@ pub async fn run_upload_loop(
     loop {
         tokio::select! {
             biased;
+
+            // ── Control path (key rotation, keepalive responses, etc.) ──
+            maybe_control = control_rx.recv() => {
+                let control = match maybe_control {
+                    Some(c) => c,
+                    None => return Err(Error::Channel("control upload channel closed".into())),
+                };
+
+                let encrypted = enc.encrypt_control(&control)?;
+                send_tolerant(udp, &encrypted).await?;
+            }
 
             // ── Data path (highest priority) ──
             maybe_pkt = rx.recv() => {

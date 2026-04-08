@@ -23,11 +23,11 @@ use aivpn_common::client_wire::{
     obfuscate_client_eph_pub, process_server_hello_with_mdh_len, RecvWindow, DEFAULT_ZERO_MDH,
 };
 use aivpn_common::crypto::{
-    derive_session_keys, KeyPair, SessionKeys,
+    self, derive_session_keys, KeyPair, SessionKeys,
 };
 use aivpn_common::error::{Error, Result};
 use aivpn_common::protocol::{ControlPayload, InnerType};
-use aivpn_common::upload_pipeline::{self, PacketEncryptor, UploadConfig, ZeroMdhEncryptor};
+use aivpn_common::upload_pipeline::{self, PacketEncryptor, UploadConfig};
 
 // ──────────── Constants ────────────
 
@@ -123,7 +123,6 @@ pub fn get_active_download_bytes() -> u64 {
 // ──────────── Entry point ────────────
 
 /// Blocking async function that runs the whole tunnel session.
-/// Returns Ok(()) only on REKEY_INTERVAL expiry (clean reconnect trigger).
 /// All errors cause the Kotlin reconnect loop to kick in.
 pub async fn run_tunnel_android(
     vm: JavaVM,
@@ -132,7 +131,8 @@ pub async fn run_tunnel_android(
     server_host: String,
     server_port: u16,
     server_key: [u8; 32],
-    psk: Option<[u8; 32]>,
+    psk: [u8; 32],
+    server_signing_pub: [u8; 32],
 ) -> Result<()> {
     let session = Arc::new(SessionRuntime::new());
     let _active_session_guard = activate_session(session.clone())?;
@@ -140,7 +140,7 @@ pub async fn run_tunnel_android(
     // ── 1. Ephemeral keypair + initial session keys (Zero-RTT like existing Kotlin) ──
     let keypair = KeyPair::generate();
     let dh = keypair.compute_shared(&server_key)?;
-    let mut keys = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+    let mut keys = derive_session_keys(&dh, Some(&psk), &keypair.public_key_bytes());
 
     // ── 2. Create and protect UDP socket ──
     // Resolve host (async DNS so we don't block the tokio thread).
@@ -190,10 +190,11 @@ pub async fn run_tunnel_android(
         &mut recv_win,
         &mut send_counter,
         DEFAULT_ZERO_MDH.len(),
+        &server_signing_pub,
     )?;
     let mut transition_recv_keys: Option<SessionKeys> = Some(derive_session_keys(
         &dh,
-        psk.as_ref(),
+        Some(&psk),
         &keypair.public_key_bytes(),
     ));
     let mut transition_recv_win = std::mem::take(&mut recv_win);
@@ -208,6 +209,7 @@ pub async fn run_tunnel_android(
     // Split upload into a dedicated pipeline:
     // TUN reader task -> channel -> UDP sender/encrypt task.
     let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(64);
     let (err_tx, mut err_rx) = mpsc::channel::<String>(16);
     let tun_err_tx = err_tx.clone();
     let sender_err_tx = err_tx.clone();
@@ -243,21 +245,43 @@ pub async fn run_tunnel_android(
     });
 
     let udp_tx = udp.clone();
-    let keys_tx = keys.clone();
+    struct AndroidCryptoState {
+        keys: SessionKeys,
+        counter: u64,
+        seq: u16,
+    }
+    let upload_state = Arc::new(Mutex::new(AndroidCryptoState {
+        keys: keys.clone(),
+        counter: send_counter,
+        seq: send_seq,
+    }));
+    let upload_state_for_sender = upload_state.clone();
     let session_for_upload = session.clone();
     let upload_sender_task = tokio::spawn(async move {
-        // Wrap ZeroMdhEncryptor with UPLOAD_BYTES tracking.
+        // Wrap zero-MDH encryption with UPLOAD_BYTES tracking.
         struct AndroidEncryptor {
-            inner: ZeroMdhEncryptor,
+            upload_state: Arc<Mutex<AndroidCryptoState>>,
             session: Arc<SessionRuntime>,
         }
 
         impl PacketEncryptor for AndroidEncryptor {
             fn encrypt_data(&mut self, payload: &[u8]) -> aivpn_common::error::Result<Vec<u8>> {
-                self.inner.encrypt_data(payload)
+                let mut state = self.upload_state.lock().expect("android upload state poisoned");
+                let inner = build_inner_packet(InnerType::Data, state.seq, payload);
+                state.seq = state.seq.wrapping_add(1);
+                let keys = state.keys.clone();
+                build_zero_mdh_packet(&keys, &mut state.counter, &inner, None)
             }
             fn encrypt_keepalive(&mut self) -> aivpn_common::error::Result<Vec<u8>> {
-                self.inner.encrypt_keepalive()
+                self.encrypt_control(&ControlPayload::Keepalive)
+            }
+            fn encrypt_control(&mut self, control: &ControlPayload) -> aivpn_common::error::Result<Vec<u8>> {
+                let mut state = self.upload_state.lock().expect("android upload state poisoned");
+                let encoded = control.encode()?;
+                let inner = build_inner_packet(InnerType::Control, state.seq, &encoded);
+                state.seq = state.seq.wrapping_add(1);
+                let keys = state.keys.clone();
+                build_zero_mdh_packet(&keys, &mut state.counter, &inner, None)
             }
             fn on_data_sent(&mut self, payload_len: usize) {
                 self.session
@@ -267,7 +291,7 @@ pub async fn run_tunnel_android(
         }
 
         let mut enc = AndroidEncryptor {
-            inner: ZeroMdhEncryptor::new(keys_tx, send_counter, send_seq),
+            upload_state: upload_state_for_sender,
             session: session_for_upload,
         };
         let config = UploadConfig {
@@ -275,12 +299,14 @@ pub async fn run_tunnel_android(
             ..Default::default()
         };
 
-        if let Err(e) = upload_pipeline::run_upload_loop(&mut tun_rx, &udp_tx, &mut enc, &config).await {
+        if let Err(e) = upload_pipeline::run_upload_loop(&mut tun_rx, &mut control_rx, &udp_tx, &mut enc, &config).await {
             let _ = sender_err_tx.send(format!("Upload pipeline: {e}")).await;
         }
     });
-    let rekey_sleep = time::sleep(REKEY_INTERVAL);
-    tokio::pin!(rekey_sleep);
+    let mut rekey_tick = time::interval(REKEY_INTERVAL);
+    rekey_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    rekey_tick.tick().await;
+    let mut pending_ratchet_keypair: Option<KeyPair> = None;
 
     // Periodic check for RX silence — uses a proper Interval so it's not
     // recreated every select! iteration (which would reset the timer).
@@ -291,12 +317,23 @@ pub async fn run_tunnel_android(
         tokio::select! {
             biased;
 
-            // ── Rekey (triggers fresh reconnect in Kotlin) ──
-            _ = &mut rekey_sleep => {
-                log::info!("aivpn: rekey interval — signalling reconnect");
-                tun_reader_task.abort();
-                upload_sender_task.abort();
-                return Ok(());
+            // ── Rekey ──
+            _ = rekey_tick.tick() => {
+                if pending_ratchet_keypair.is_none() {
+                    let ratchet_keypair = KeyPair::generate();
+                    let control = ControlPayload::KeyRotate {
+                        new_eph_pub: ratchet_keypair.public_key_bytes(),
+                    };
+                    pending_ratchet_keypair = Some(ratchet_keypair);
+                    if control_tx.send(control).await.is_err() {
+                        tun_reader_task.abort();
+                        upload_sender_task.abort();
+                        return Err(Error::Channel("control upload channel closed".into()));
+                    }
+                    log::info!("aivpn: key rotation requested");
+                } else {
+                    log::warn!("aivpn: key rotation still pending");
+                }
             }
 
             // ── UDP → TUN (inbound from server) ──
@@ -318,10 +355,10 @@ pub async fn run_tunnel_android(
                         Some(decoded)
                     }
                     Err(_) => {
-                        if let Some(fallback_keys) = transition_recv_keys.as_ref() {
+                        if let Some(previous_keys) = transition_recv_keys.as_ref() {
                             decode_packet_with_mdh_len(
                                 &udp_buf[..n],
-                                fallback_keys,
+                                previous_keys,
                                 &mut transition_recv_win,
                                 DEFAULT_ZERO_MDH.len(),
                             ).ok()
@@ -337,6 +374,40 @@ pub async fn run_tunnel_android(
                         session
                             .download_bytes
                             .fetch_add(decoded.payload.len() as u64, Ordering::Relaxed);
+                    } else if decoded.header.inner_type == InnerType::Control {
+                        match ControlPayload::decode(&decoded.payload)? {
+                            ControlPayload::ServerHello { server_eph_pub, signature } => {
+                                let ratchet_keypair = pending_ratchet_keypair
+                                    .take()
+                                    .ok_or_else(|| Error::Session("Unexpected ServerHello".into()))?;
+                                crypto::verify_server_hello_signature(
+                                    &server_signing_pub,
+                                    &server_eph_pub,
+                                    &ratchet_keypair.public_key_bytes(),
+                                    &signature,
+                                )?;
+                                let dh2 = ratchet_keypair.compute_shared(&server_eph_pub)?;
+                                let current_key = keys.session_key;
+                                let ratcheted = derive_session_keys(
+                                    &dh2,
+                                    Some(&current_key),
+                                    &ratchet_keypair.public_key_bytes(),
+                                );
+                                transition_recv_keys = Some(keys.clone());
+                                transition_recv_win = std::mem::take(&mut recv_win);
+                                keys = ratcheted.clone();
+                                {
+                                    let mut state = upload_state.lock().expect("android upload state poisoned");
+                                    state.keys = ratcheted;
+                                    state.counter = 0;
+                                }
+                                log::info!("aivpn: key rotation applied");
+                            }
+                            ControlPayload::Keepalive | ControlPayload::ControlAck { .. } => {}
+                            other => {
+                                log::debug!("aivpn: control from server: {:?}", other);
+                            }
+                        }
                     }
                     // Any successfully decoded packet (including keepalive responses)
                     // proves the link is alive.

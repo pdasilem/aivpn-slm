@@ -442,12 +442,8 @@ impl SessionManager {
             &eph_pub,
         );
         
-        // Sign (server_eph_pub || client_eph_pub) for server authentication (HIGH-6)
-        use ed25519_dalek::Signer;
-        let mut sign_message = Vec::with_capacity(64);
-        sign_message.extend_from_slice(&server_eph_pub);
-        sign_message.extend_from_slice(&eph_pub);
-        let signature = self.signing_key.sign(&sign_message).to_bytes();
+        // Sign (server_eph_pub || client_eph_pub) for server authentication.
+        let signature = crypto::sign_server_hello(&self.signing_key, &server_eph_pub, &eph_pub);
         
         // Generate session ID
         let mut session_id = [0u8; 16];
@@ -726,6 +722,53 @@ impl SessionManager {
                 self.tag_map.insert(*tag, *session_id);
             }
         }
+    }
+
+    /// Prepare an in-band key rotation using the current session key as
+    /// domain-separation PSK. The returned ServerHello must be sent encrypted
+    /// with the currently active keys; the next valid client packet under the
+    /// ratcheted tag window will commit the rotation.
+    pub fn prepare_session_key_rotation(
+        &self,
+        session_id: &[u8; 16],
+        client_eph_pub: [u8; X25519_PUBLIC_KEY_SIZE],
+    ) -> Result<ControlPayload> {
+        let session = self.sessions.get(session_id)
+            .ok_or_else(|| Error::Session("Session not found for key rotation".into()))?
+            .clone();
+
+        let server_eph_kp = crypto::KeyPair::generate();
+        let server_eph_pub = server_eph_kp.public_key_bytes();
+        let dh2 = server_eph_kp.compute_shared(&client_eph_pub)?;
+        let signature = crypto::sign_server_hello(&self.signing_key, &server_eph_pub, &client_eph_pub);
+
+        {
+            let mut sess = session.lock();
+
+            for tag in sess.ratcheted_expected_tags.values() {
+                self.tag_map.remove(tag);
+            }
+            sess.ratcheted_expected_tags.clear();
+
+            let current_key = sess.keys.session_key;
+            let ratcheted_keys = crypto::derive_session_keys(
+                &dh2,
+                Some(&current_key),
+                &client_eph_pub,
+            );
+
+            sess.state = SessionState::Rotating;
+            sess.server_eph_pub = Some(server_eph_pub);
+            sess.server_hello_signature = Some(signature);
+            sess.ratcheted_keys = Some(ratcheted_keys);
+            sess.update_ratcheted_tag_window();
+
+            for tag in sess.ratcheted_expected_tags.values() {
+                self.tag_map.insert(*tag, *session_id);
+            }
+        }
+
+        Ok(ControlPayload::ServerHello { server_eph_pub, signature })
     }
     
     /// Cleanup expired sessions

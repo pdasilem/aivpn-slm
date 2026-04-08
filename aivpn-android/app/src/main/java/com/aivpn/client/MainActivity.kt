@@ -19,6 +19,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import com.aivpn.client.databinding.ActivityMainBinding
 import org.json.JSONObject
+import java.util.Locale
 import java.util.UUID
 
 /**
@@ -71,8 +72,8 @@ class MainActivity : AppCompatActivity() {
                 val h = elapsed / 3600
                 val m = (elapsed % 3600) / 60
                 val s = elapsed % 60
-                binding.textTimer.text = String.format("%02d:%02d:%02d", h, m, s)
-                binding.textDuration.text = String.format("%02d:%02d", h * 60 + m, s)
+                binding.textTimer.text = String.format(Locale.ROOT, "%02d:%02d:%02d", h, m, s)
+                binding.textDuration.text = String.format(Locale.ROOT, "%02d:%02d", h * 60 + m, s)
                 timerHandler.postDelayed(this, 1000)
             }
         }
@@ -83,9 +84,6 @@ class MainActivity : AppCompatActivity() {
         applyTheme()
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
-        // Migrate legacy single connection key to profiles
-        migrateLegacyKey()
 
         // Load profiles
         profiles = SecureStorage.loadProfiles(this)
@@ -99,9 +97,6 @@ class MainActivity : AppCompatActivity() {
             activeProfileId = profiles[0].id
             binding.editConnectionKey.setText(profiles[0].key)
             SecureStorage.saveActiveProfileId(this, profiles[0].id)
-        } else {
-            // Fallback: try legacy key
-            binding.editConnectionKey.setText(SecureStorage.loadConnectionKey(this))
         }
 
         renderProfiles()
@@ -134,25 +129,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ──────────── Profile management ────────────
-
-    private fun migrateLegacyKey() {
-        val legacyKey = SecureStorage.loadConnectionKey(this)
-        if (legacyKey.isNotEmpty()) {
-            val existing = SecureStorage.loadProfiles(this)
-            if (existing.none { it.key == legacyKey }) {
-                val profile = SecureStorage.ConnectionProfile(
-                    id = UUID.randomUUID().toString(),
-                    name = extractServerName(legacyKey),
-                    key = legacyKey
-                )
-                val updated = existing.toMutableList()
-                updated.add(profile)
-                SecureStorage.saveProfiles(this, updated)
-                SecureStorage.saveActiveProfileId(this, profile.id)
-            }
-            SecureStorage.remove(this, "connection_key")
-        }
-    }
 
     private fun extractServerName(connectionKey: String): String {
         val parsed = parseConnectionKey(connectionKey) ?: return "Server"
@@ -352,10 +328,10 @@ class MainActivity : AppCompatActivity() {
         val siteCount = SecureStorage.loadExcludedDomains(this).size
         binding.textSplitTunnelHint.text = when {
             appCount > 0 && siteCount > 0 -> getString(R.string.split_tunnel_hint_combined,
-                getString(R.string.split_tunnel_hint_apps, appCount),
-                getString(R.string.split_tunnel_hint_sites, siteCount))
-            appCount > 0 -> getString(R.string.split_tunnel_vpn_count, appCount)
-            siteCount > 0 -> getString(R.string.split_tunnel_hint_sites, siteCount) + " " + getString(R.string.split_tunnel_bypass_count, siteCount).substringAfter(" ")
+                resources.getQuantityString(R.plurals.split_tunnel_hint_apps, appCount, appCount),
+                resources.getQuantityString(R.plurals.split_tunnel_hint_sites, siteCount, siteCount))
+            appCount > 0 -> resources.getQuantityString(R.plurals.split_tunnel_vpn_count, appCount, appCount)
+            siteCount > 0 -> resources.getQuantityString(R.plurals.split_tunnel_bypass_count, siteCount, siteCount)
             else -> getString(R.string.split_tunnel_none)
         }
     }
@@ -401,8 +377,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Parse connection key: aivpn://BASE64URL({"s":"host:port","k":"...","p":"...","i":"..."})
-     * Returns (server, serverKey, psk, vpnIp) or null on failure.
+     * Parse connection key: aivpn://BASE64URL({"s":"host:port","k":"...","g":"...","p":"...","i":"..."})
+     * Returns (server, serverKey, serverSigningKey, psk, vpnIp) or null on failure.
      */
     private fun parseConnectionKey(key: String): Array<String>? {
         val raw = key.trim()
@@ -414,9 +390,10 @@ class MainActivity : AppCompatActivity() {
             val json = JSONObject(String(jsonBytes))
             val server = json.getString("s")
             val serverKey = json.getString("k")
+            val serverSigningKey = json.getString("g")
             val psk = json.getString("p")
             val vpnIp = json.getString("i")
-            arrayOf(server, serverKey, psk, vpnIp)
+            arrayOf(server, serverKey, serverSigningKey, psk, vpnIp)
         } catch (_: Exception) {
             null
         }
@@ -468,12 +445,13 @@ class MainActivity : AppCompatActivity() {
     private fun startVpnService() {
         val connectionKey = binding.editConnectionKey.text.toString().trim()
         val parsed = parseConnectionKey(connectionKey) ?: return
-        val (server, serverKey, psk, vpnIp) = parsed
+        val (server, serverKey, serverSigningKey, psk, vpnIp) = parsed
 
         val intent = Intent(this, AivpnService::class.java).apply {
             action = AivpnService.ACTION_CONNECT
             putExtra("server", server)
             putExtra("server_key", serverKey)
+            putExtra("server_signing_key", serverSigningKey)
             putExtra("psk", psk)
             putExtra("vpn_ip", vpnIp)
         }
@@ -511,10 +489,10 @@ class MainActivity : AppCompatActivity() {
         } else if (!connected) {
             connectionStartTime = 0L
             timerHandler.removeCallbacks(timerRunnable)
-            binding.textTimer.text = "00:00:00"
-            binding.textUpload.text = "0 B"
-            binding.textDownload.text = "0 B"
-            binding.textDuration.text = "00:00"
+            binding.textTimer.text = getString(R.string.timer_zero)
+            binding.textUpload.text = getString(R.string.bytes_zero)
+            binding.textDownload.text = getString(R.string.bytes_zero)
+            binding.textDuration.text = getString(R.string.duration_zero)
         }
     }
 
@@ -535,15 +513,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateThemeButton() {
-        binding.btnTheme.text = if (SecureStorage.loadTheme(this) == "light") "Dark" else "Light"
+        binding.btnTheme.text = getString(
+            if (SecureStorage.loadTheme(this) == "light") R.string.btn_theme_dark else R.string.btn_theme_light
+        )
     }
 
     private fun formatBytes(bytes: Long): String {
         return when {
             bytes < 1024 -> "$bytes B"
-            bytes < 1024 * 1024 -> String.format("%.1f KB", bytes / 1024.0)
-            bytes < 1024 * 1024 * 1024 -> String.format("%.1f MB", bytes / (1024.0 * 1024.0))
-            else -> String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+            bytes < 1024 * 1024 -> String.format(Locale.ROOT, "%.1f KB", bytes / 1024.0)
+            bytes < 1024 * 1024 * 1024 -> String.format(Locale.ROOT, "%.1f MB", bytes / (1024.0 * 1024.0))
+            else -> String.format(Locale.ROOT, "%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
         }
     }
 

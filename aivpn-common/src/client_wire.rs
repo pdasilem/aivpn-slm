@@ -207,6 +207,7 @@ pub fn process_server_hello_with_mdh_len(
     recv_window: &mut RecvWindow,
     send_counter: &mut u64,
     mdh_len: usize,
+    server_signing_pub: &[u8; 32],
 ) -> Result<()> {
     let decoded = decode_packet_with_mdh_len(packet, keys, recv_window, mdh_len)?;
 
@@ -215,7 +216,13 @@ pub fn process_server_hello_with_mdh_len(
     }
 
     match ControlPayload::decode(&decoded.payload)? {
-        ControlPayload::ServerHello { server_eph_pub, .. } => {
+        ControlPayload::ServerHello { server_eph_pub, signature } => {
+            crypto::verify_server_hello_signature(
+                server_signing_pub,
+                &server_eph_pub,
+                &keypair.public_key_bytes(),
+                &signature,
+            )?;
             let dh2 = keypair.compute_shared(&server_eph_pub)?;
             let old_session_key = keys.session_key;
             *keys = derive_session_keys(&dh2, Some(&old_session_key), &keypair.public_key_bytes());

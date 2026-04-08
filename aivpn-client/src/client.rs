@@ -38,11 +38,11 @@ use crate::tunnel::{Tunnel, TunnelConfig};
 pub struct ClientConfig {
     pub server_addr: String,
     pub server_public_key: [u8; X25519_PUBLIC_KEY_SIZE],
-    pub preshared_key: Option<[u8; 32]>,
+    pub preshared_key: [u8; 32],
     pub initial_mask: MaskProfile,
     pub tun_config: TunnelConfig,
     /// Server's Ed25519 signing public key for authentication (HIGH-6)
-    pub server_signing_pub: Option<[u8; 32]>,
+    pub server_signing_pub: [u8; 32],
 }
 
 /// Client state
@@ -72,6 +72,7 @@ pub struct AivpnClient {
     session_keys: Option<SessionKeys>,
     upload_state: Option<Arc<Mutex<UploadCryptoState>>>,
     transition_recv_keys: Option<SessionKeys>,
+    pending_ratchet_keypair: Option<KeyPair>,
     keypair: KeyPair,
     counter: u64,
     send_seq: u32,
@@ -103,6 +104,7 @@ impl AivpnClient {
             session_keys: None,
             upload_state: None,
             transition_recv_keys: None,
+            pending_ratchet_keypair: None,
             keypair,
             counter: 0,
             send_seq: 0,
@@ -168,7 +170,7 @@ impl AivpnClient {
         let dh_result = self.keypair.compute_shared(&self.config.server_public_key)?;
         self.session_keys = Some(crypto::derive_session_keys(
             &dh_result,
-            self.config.preshared_key.as_ref(),
+            Some(&self.config.preshared_key),
             &self.keypair.public_key_bytes(),
         ));
         
@@ -198,6 +200,7 @@ impl AivpnClient {
         self.session_keys = None;
         self.upload_state = None;
         self.transition_recv_keys = None;
+        self.pending_ratchet_keypair = None;
     }
     
     /// Run the client main loop
@@ -213,6 +216,7 @@ impl AivpnClient {
         // Create channels for TUN -> upload pipeline and UDP -> main loop
         let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(8192);
         let (udp_to_tun_tx, mut udp_to_tun_rx) = mpsc::channel::<Bytes>(8192);
+        let (control_tx, control_rx) = mpsc::channel::<ControlPayload>(64);
 
         // Take the TUN reader for the spawned task (no Mutex needed)
         let mut tun_reader = self.tunnel.take_reader()
@@ -330,6 +334,7 @@ impl AivpnClient {
 
         let mut upload_task = tokio::spawn(Self::spawn_upload(
             tun_to_udp_rx,
+            control_rx,
             upload_udp,
             upload_engine,
             upload_state,
@@ -339,6 +344,9 @@ impl AivpnClient {
         // Main loop: download + shutdown + upload health
         let mut shutdown_tick = tokio::time::interval(Duration::from_secs(1));
         shutdown_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut rekey_tick = tokio::time::interval(Duration::from_secs(30 * 60));
+        rekey_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        rekey_tick.tick().await;
 
         let run_res: Result<()> = loop {
             tokio::select! {
@@ -360,6 +368,21 @@ impl AivpnClient {
                         Ok(Err(e)) => Err(e),
                         Err(e) => Err(Error::Session(format!("Upload task panicked: {e}"))),
                     };
+                }
+
+                _ = rekey_tick.tick() => {
+                    if self.pending_ratchet_keypair.is_none() {
+                        let ratchet_keypair = KeyPair::generate();
+                        let control = ControlPayload::KeyRotate {
+                            new_eph_pub: ratchet_keypair.public_key_bytes(),
+                        };
+                        self.pending_ratchet_keypair = Some(ratchet_keypair);
+                        control_tx.send(control).await
+                            .map_err(|_| Error::Channel("control upload channel closed".into()))?;
+                        info!("Key rotation requested");
+                    } else {
+                        warn!("Skipping key rotation request: previous rotation is still pending");
+                    }
                 }
 
                 // UDP -> TUN (inbound traffic)
@@ -396,6 +419,7 @@ impl AivpnClient {
     /// Spawn the upload task using the shared pipeline.
     async fn spawn_upload(
         mut rx: mpsc::Receiver<Vec<u8>>,
+        mut control_rx: mpsc::Receiver<ControlPayload>,
         udp: Arc<UdpSocket>,
         engine: MimicryEngine,
         upload_state: Arc<Mutex<UploadCryptoState>>,
@@ -420,9 +444,13 @@ impl AivpnClient {
             }
 
             fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
+                self.encrypt_control(&ControlPayload::Keepalive)
+            }
+
+            fn encrypt_control(&mut self, control: &ControlPayload) -> Result<Vec<u8>> {
                 let mut state = self.upload_state.lock().expect("upload state poisoned");
-                let keepalive = ControlPayload::Keepalive.encode()?;
-                let inner = build_inner_packet(InnerType::Control, state.seq, &keepalive);
+                let encoded = control.encode()?;
+                let inner = build_inner_packet(InnerType::Control, state.seq, &encoded);
                 state.seq = state.seq.wrapping_add(1);
                 let keys = state.keys.clone();
                 self.engine.build_packet(&inner, &keys, &mut state.counter, None)
@@ -438,7 +466,7 @@ impl AivpnClient {
             keepalive_interval: Duration::from_secs(15),
             ..Default::default()
         };
-        upload_pipeline::run_upload_loop(&mut rx, &udp, &mut enc, &config).await
+        upload_pipeline::run_upload_loop(&mut rx, &mut control_rx, &udp, &mut enc, &config).await
     }
 
     /// Receive packet from server and write to TUN (using pre-computed mdh_len)
@@ -455,13 +483,13 @@ impl AivpnClient {
                 decoded
             }
             Err(primary_err) => {
-                let Some(fallback_keys) = self.transition_recv_keys.as_ref() else {
+                let Some(previous_keys) = self.transition_recv_keys.as_ref() else {
                     return Err(primary_err);
                 };
 
                 decode_packet_with_mdh_len(
                     packet,
-                    fallback_keys,
+                    previous_keys,
                     &mut self.transition_recv_window,
                     mdh_len,
                 )?
@@ -505,30 +533,27 @@ impl AivpnClient {
             }
             ControlPayload::ServerHello { server_eph_pub, signature } => {
                 info!("ServerHello received — completing PFS ratchet");
+                let ratchet_keypair = self.pending_ratchet_keypair
+                    .take()
+                    .unwrap_or_else(|| self.keypair.clone());
                 
-                // Verify Ed25519 signature if server signing key configured (HIGH-6)
-                if let Some(signing_pub) = &self.config.server_signing_pub {
-                    use ed25519_dalek::{VerifyingKey, Verifier, Signature};
-                    let vk = VerifyingKey::from_bytes(signing_pub)
-                        .map_err(|e| Error::Crypto(format!("Invalid server signing key: {}", e)))?;
-                    let mut message = Vec::with_capacity(64);
-                    message.extend_from_slice(&server_eph_pub);
-                    message.extend_from_slice(&self.keypair.public_key_bytes());
-                    let sig = Signature::from_bytes(&signature);
-                    vk.verify(&message, &sig)
-                        .map_err(|_| Error::Crypto("ServerHello signature verification failed".into()))?;
-                    info!("Server authenticated via Ed25519 signature");
-                }
+                crypto::verify_server_hello_signature(
+                    &self.config.server_signing_pub,
+                    &server_eph_pub,
+                    &ratchet_keypair.public_key_bytes(),
+                    &signature,
+                )?;
+                info!("Server authenticated via Ed25519 signature");
                 
                 // Compute DH2 = client_eph * server_eph for PFS (CRIT-3)
-                let dh2 = self.keypair.compute_shared(&server_eph_pub)?;
+                let dh2 = ratchet_keypair.compute_shared(&server_eph_pub)?;
                 
                 // Derive ratcheted keys using current session_key as PSK
                 let current_key = self.session_keys.as_ref()
                     .ok_or(Error::Session("No session keys for ratchet".into()))?
                     .session_key;
                 let ratcheted = crypto::derive_session_keys(
-                    &dh2, Some(&current_key), &self.keypair.public_key_bytes(),
+                    &dh2, Some(&current_key), &ratchet_keypair.public_key_bytes(),
                 );
 
                 // Keep accepting old inbound keys until the server proves it has

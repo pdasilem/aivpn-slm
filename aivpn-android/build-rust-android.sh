@@ -68,7 +68,9 @@ pick_android_java_home() {
 
 if JAVA_HOME_SELECTED="$(pick_android_java_home)"; then
     export JAVA_HOME="${JAVA_HOME_SELECTED}"
-    export PATH="${JAVA_HOME}/bin:${PATH}"
+    if [[ ":${PATH}:" != *":${JAVA_HOME}/bin:"* ]]; then
+        export PATH="${PATH}:${JAVA_HOME}/bin"
+    fi
 else
     echo "ERROR: Java runtime not found. Install JDK 17 or JDK 21 and retry."
     exit 1

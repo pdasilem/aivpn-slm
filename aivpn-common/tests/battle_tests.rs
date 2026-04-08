@@ -288,6 +288,19 @@ fn battle_control_payload_key_rotate_roundtrip() {
 }
 
 #[test]
+fn battle_control_payload_key_rotate_rejects_invalid_length() {
+    let mut encoded = vec![ControlSubtype::KeyRotate as u8, 0];
+    encoded.extend_from_slice(&31u16.to_le_bytes());
+    encoded.extend_from_slice(&[0xABu8; 31]);
+    assert!(ControlPayload::decode(&encoded).is_err());
+
+    let mut encoded = vec![ControlSubtype::KeyRotate as u8, 0];
+    encoded.extend_from_slice(&33u16.to_le_bytes());
+    encoded.extend_from_slice(&[0xABu8; 33]);
+    assert!(ControlPayload::decode(&encoded).is_err());
+}
+
+#[test]
 fn battle_control_payload_time_sync_roundtrip() {
     let payload = ControlPayload::TimeSync { server_ts_ms: 1700000000000 };
     let encoded = payload.encode().unwrap();
