@@ -4,7 +4,6 @@ set -euo pipefail
 APP_NAME="AIVPN"
 CONFIG_DIR="config"
 ENV_FILE=".env"
-COMPOSE_FILE="docker-compose.yml"
 VPN_SUBNET="10.0.0.0/24"
 VPN_PORT="443"
 ADMIN_PORT="27449"
@@ -35,6 +34,16 @@ confirm() {
   case "$answer" in
     y|Y|yes|YES) return 0 ;;
     *) return 1 ;;
+  esac
+}
+
+confirm_default_yes() {
+  local prompt="$1"
+  local answer
+  read -r -p "$prompt [Y/n]: " answer
+  case "$answer" in
+    n|N|no|NO) return 1 ;;
+    *) return 0 ;;
   esac
 }
 
@@ -137,6 +146,43 @@ server_host_for_urls() {
 detect_tailscale_ip() {
   if command -v tailscale >/dev/null 2>&1; then
     tailscale ip -4 2>/dev/null | head -n 1 || true
+  fi
+}
+
+ensure_latest_checkout_for_install() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+
+  local branch upstream remote_name remote_url local_rev remote_rev
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+  if [ -z "$upstream" ]; then
+    upstream="origin/${branch}"
+  fi
+
+  remote_name="${upstream%%/*}"
+  remote_url="$(git remote get-url "$remote_name" 2>/dev/null || true)"
+  if [ -n "$remote_url" ]; then
+    printf 'Install source: %s (%s)\n' "$upstream" "$remote_url"
+  else
+    printf 'Install source: %s\n' "$upstream"
+  fi
+
+  git fetch --prune
+  local_rev="$(git rev-parse HEAD)"
+  remote_rev="$(git rev-parse "$upstream" 2>/dev/null || true)"
+  [ -n "$remote_rev" ] || die "Cannot resolve upstream $upstream."
+
+  if [ "$local_rev" = "$remote_rev" ]; then
+    printf 'Local checkout is up to date: %s\n' "$local_rev"
+    return 0
+  fi
+
+  printf 'Local checkout is behind upstream.\n'
+  printf 'Local:  %s\nRemote: %s (%s)\n' "$local_rev" "$remote_rev" "$upstream"
+  if confirm_default_yes "Pull latest code before install?"; then
+    git pull --ff-only
+  else
+    warn "Installing from local checkout ${local_rev}."
   fi
 }
 
@@ -251,6 +297,7 @@ prepare_settings_from_scratch() {
 install_aivpn() {
   ensure_base_requirements
   log "Install ${APP_NAME}"
+  ensure_latest_checkout_for_install
 
   if is_installed; then
     warn "${APP_NAME} appears to be installed already."
