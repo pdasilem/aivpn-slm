@@ -19,6 +19,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import com.aivpn.client.databinding.ActivityMainBinding
 import org.json.JSONObject
+import java.util.Base64
 import java.util.Locale
 import java.util.UUID
 
@@ -36,6 +37,7 @@ class MainActivity : AppCompatActivity() {
     private var profiles = mutableListOf<SecureStorage.ConnectionProfile>()
     private var activeProfileId: String? = null
     private var pendingScanTarget: EditText? = null
+    private var connectionKeyParseError = ""
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -256,7 +258,7 @@ class MainActivity : AppCompatActivity() {
                     return@setPositiveButton
                 }
                 if (parseConnectionKey(key) == null) {
-                    Toast.makeText(this, getString(R.string.error_profile_key_invalid), Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, connectionKeyParseError.ifEmpty { getString(R.string.error_profile_key_invalid) }, Toast.LENGTH_LONG).show()
                     return@setPositiveButton
                 }
 
@@ -377,26 +379,67 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Parse connection key: aivpn://BASE64URL({"s":"host:port","k":"...","g":"...","p":"...","i":"..."})
+     * Parse connection key: aivpn://BASE64URL_NO_PAD({"s":"host:port","k":"...","g":"...","p":"...","i":"..."})
      * Returns (server, serverKey, serverSigningKey, psk, vpnIp) or null on failure.
      */
     private fun parseConnectionKey(key: String): Array<String>? {
         val raw = key.trim()
-        val payload = if (raw.startsWith("aivpn://")) raw.removePrefix("aivpn://") else raw
-        return try {
-            // Decode URL-safe base64 (no padding)
-            val jsonBytes = android.util.Base64.decode(payload,
-                android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP)
-            val json = JSONObject(String(jsonBytes))
-            val server = json.getString("s")
-            val serverKey = json.getString("k")
-            val serverSigningKey = json.getString("g")
-            val psk = json.getString("p")
-            val vpnIp = json.getString("i")
-            arrayOf(server, serverKey, serverSigningKey, psk, vpnIp)
-        } catch (_: Exception) {
-            null
+        connectionKeyParseError = ""
+        if (!raw.startsWith("aivpn://")) {
+            connectionKeyParseError = getString(R.string.error_connection_key_prefix)
+            return null
         }
+        val payload = raw.removePrefix("aivpn://")
+        val json = try {
+            val jsonBytes = Base64.getUrlDecoder().decode(payload)
+            JSONObject(String(jsonBytes, Charsets.UTF_8))
+        } catch (_: Exception) {
+            connectionKeyParseError = getString(R.string.error_connection_key_payload)
+            return null
+        }
+        val server = requiredConnectionKeyField(json, "s") ?: return null
+        val serverKey = requiredConnectionKeyField(json, "k") ?: return null
+        val serverSigningKey = requiredConnectionKeyField(json, "g") ?: return null
+        val psk = requiredConnectionKeyField(json, "p") ?: return null
+        val vpnIp = requiredConnectionKeyField(json, "i") ?: return null
+        if (!requireDecodedKeySize("server public key", serverKey, 32)) return null
+        if (!requireDecodedKeySize("server signing key", serverSigningKey, 32)) return null
+        if (!requireDecodedKeySize("preshared key", psk, 32)) return null
+        return arrayOf(server, serverKey, serverSigningKey, psk, vpnIp)
+    }
+
+    private fun requiredConnectionKeyField(json: JSONObject, name: String): String? {
+        val value = json.optString(name, "")
+        return if (value.isBlank()) {
+            connectionKeyParseError = getString(R.string.error_connection_key_missing_field, name)
+            null
+        } else {
+            value
+        }
+    }
+
+    private fun requireDecodedKeySize(label: String, value: String, expectedSize: Int): Boolean {
+        val decoded = try {
+            android.util.Base64.decode(value, android.util.Base64.DEFAULT)
+        } catch (_: IllegalArgumentException) {
+            connectionKeyParseError = resources.getQuantityString(
+                R.plurals.error_connection_key_size,
+                expectedSize,
+                label,
+                expectedSize
+            )
+            return false
+        }
+        if (decoded.size != expectedSize) {
+            connectionKeyParseError = resources.getQuantityString(
+                R.plurals.error_connection_key_size,
+                expectedSize,
+                label,
+                expectedSize
+            )
+            return false
+        }
+        return true
     }
 
     private fun connect() {

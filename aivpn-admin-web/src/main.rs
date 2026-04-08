@@ -307,15 +307,16 @@ fn update_status(state: &AppState) -> Response {
         );
     }
 
-    let branch = match git_capture(repo, &["rev-parse", "--abbrev-ref", "HEAD"]) {
-        Ok(value) => value,
+    let upstream = match git_capture(repo, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
+        Ok(value) if value != "HEAD" => value,
+        Ok(_) => {
+            return Response::json(
+                500,
+                serde_json::json!({ "error": "git upstream is not configured for this branch" }),
+            )
+        }
         Err(err) => return Response::json(500, serde_json::json!({ "error": err })),
     };
-    let mut upstream = git_capture(repo, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        .unwrap_or_else(|_| format!("origin/{}", branch));
-    if upstream == "HEAD" {
-        upstream = format!("origin/{}", branch);
-    }
     let remote_name = upstream.split('/').next().unwrap_or("origin");
     let remote_url = git_capture(repo, &["remote", "get-url", remote_name]).unwrap_or_default();
 
@@ -345,7 +346,6 @@ fn update_status(state: &AppState) -> Response {
         200,
         serde_json::json!({
             "repo": repo,
-            "branch": branch,
             "upstream": upstream,
             "remoteUrl": remote_url,
             "local": local,
@@ -464,7 +464,7 @@ fn run_logged_command(mut command: Command, label: &str, job: Arc<Mutex<UpdateJo
 fn run_update_job(repo: PathBuf, job: Arc<Mutex<UpdateJob>>) -> Result<(), String> {
     append_update_log(
         &job,
-        "Note: this job does not restart aivpn-admin-web itself, because restarting this container would cut off the live log stream. Rebuild/restart aivpn-admin-web separately after reviewing the log.",
+        "Note: aivpn-admin-web will restart at the end of the update. This page may disconnect; reload it after a few seconds.",
     );
 
     let mut pull = Command::new("git");
@@ -491,28 +491,49 @@ fn run_update_job(repo: PathBuf, job: Arc<Mutex<UpdateJob>>) -> Result<(), Strin
 
     match run_logged_command(compose, "docker compose up -d --build", job.clone()) {
         Ok(()) => {
-            append_update_log(
-                &job,
-                "Admin UI restart is still pending. Run: docker compose up -d --build aivpn-admin-web",
-            );
-            Ok(())
-        }
-        Err(err) => {
-            append_update_log(&job, format!("docker compose failed: {err}"));
-            append_update_log(&job, "Trying docker-compose fallback...");
-            let mut fallback = Command::new("docker-compose");
-            fallback
+            let mut build_admin_web = Command::new("docker");
+            build_admin_web
+                .arg("compose")
                 .arg("-f")
                 .arg(&compose_file)
                 .arg("--project-directory")
                 .arg(&repo)
-                .arg("up")
-                .arg("-d")
-                .arg("--build")
-                .args(services);
-            run_logged_command(fallback, "docker-compose up -d --build", job)
+                .arg("build")
+                .arg("aivpn-admin-web");
+            run_logged_command(build_admin_web, "docker compose build aivpn-admin-web", job.clone())?;
+
+            schedule_admin_web_restart(&repo, &compose_file, job)
+        }
+        Err(err) => {
+            append_update_log(&job, format!("docker compose failed: {err}"));
+            Err(err)
         }
     }
+}
+
+fn schedule_admin_web_restart(
+    repo: &Path,
+    compose_file: &Path,
+    job: Arc<Mutex<UpdateJob>>,
+) -> Result<(), String> {
+    append_update_log(&job, "Scheduling aivpn-admin-web restart in 2 seconds...");
+    let command = format!(
+        "sleep 2; docker compose -f {} --project-directory {} up -d --no-build aivpn-admin-web >/tmp/aivpn-admin-web-restart.log 2>&1",
+        shell_quote(compose_file),
+        shell_quote(repo),
+    );
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("{command} &"))
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    append_update_log(&job, "Admin UI restart scheduled. Reload this page after it disconnects.");
+    Ok(())
+}
+
+fn shell_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn parse_json_body(request: &Request) -> Result<Value, serde_json::Error> {
@@ -763,7 +784,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .qr:empty { display: none; }
     .qr svg { max-width: 256px; width: 100%; height: auto; }
     .key-wrap { position: relative; display: inline-flex; flex-direction: column; align-items: center; max-width: 100%; }
-    .key-popover { display: none; position: absolute; z-index: 10; top: calc(100% + 8px); left: 50%; transform: translateX(-50%); width: min(680px, calc(100vw - 48px)); background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: 8px; padding: 12px; box-shadow: 0 16px 48px rgba(0, 0, 0, .35); }
+    .key-popover { display: none; position: fixed; z-index: 10; width: min(680px, calc(100vw - 48px)); background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: 8px; padding: 12px; box-shadow: 0 16px 48px rgba(0, 0, 0, .35); }
     .key-wrap.has-key.popover-open .key-popover { display: block; }
     .key-text { margin: 8px 0 0; user-select: text; }
     details { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--panel-2); }
@@ -813,9 +834,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
   <section id="connectionSection" hidden>
     <h2>Connection key</h2>
-    <div id="connectionKeyWrap" class="key-wrap" onmouseenter="showKeyPopover()" onmouseleave="scheduleHideKeyPopover()">
-      <div id="connectionQr" class="qr" tabindex="0" onfocus="showKeyPopover()" onblur="scheduleHideKeyPopover()"></div>
-      <div id="connectionKeyPopover" class="key-popover" role="tooltip" onmouseenter="showKeyPopover()" onmouseleave="scheduleHideKeyPopover()">
+    <div id="connectionKeyWrap" class="key-wrap">
+      <div id="connectionQr" class="qr" tabindex="0" onmouseenter="showKeyPopover()" onmouseleave="scheduleHideKeyPopover()" onfocus="showKeyPopover()" onblur="hideKeyPopover()"></div>
+      <div id="connectionKeyPopover" class="key-popover" role="tooltip" onmouseenter="cancelHideKeyPopover()" onmouseleave="hideKeyPopover()" onfocusin="cancelHideKeyPopover()" onfocusout="hideKeyPopover()">
         <div class="row">
           <button onclick="copyConnectionKey()">Copy</button>
           <span id="copyStatus" class="muted"></span>
@@ -847,6 +868,7 @@ document.documentElement.dataset.theme = localStorage.getItem('aivpnTheme') || '
 document.getElementById('grafanaLink').href = `${location.protocol}//${location.hostname}:3000/`;
 let currentConnectionKey = '';
 let updatePollTimer = null;
+let updateRunning = false;
 let keyPopoverTimer = null;
 
 function useToken() {
@@ -889,9 +911,9 @@ async function openUpdateDialog() {
   dialog.showModal();
   try {
     const data = await api('/api/update/status');
-    const commits = data.commits && data.commits.length
-      ? ['Missing commits:', ...data.commits.map(line => `  ${line}`)]
-      : ['Missing commits: -'];
+    const commits = data.upToDate || !data.commits || !data.commits.length
+      ? []
+      : ['', ...data.commits.map(line => `  ${line}`)];
     status.textContent = [
       `Repository: ${data.repo}`,
       `Remote: ${data.remoteUrl || '-'}`,
@@ -908,10 +930,12 @@ async function openUpdateDialog() {
 }
 
 async function runUpdate() {
+  if (updateRunning) return;
   if (!confirm('Update from origin and restart AIVPN services? Admin UI restart is handled separately so this log can stay visible.')) return;
   const status = document.getElementById('updateStatus');
   const button = document.getElementById('runUpdateButton');
   const closeButton = document.getElementById('closeUpdateButton');
+  updateRunning = true;
   button.disabled = true;
   closeButton.disabled = true;
   status.textContent = 'Starting update...\n';
@@ -920,6 +944,7 @@ async function runUpdate() {
     pollUpdateLog();
   } catch (err) {
     status.textContent = `Update failed: ${err.message || err}`;
+    updateRunning = false;
     closeButton.disabled = false;
   }
 }
@@ -931,11 +956,15 @@ async function pollUpdateLog() {
   const closeButton = document.getElementById('closeUpdateButton');
   try {
     const data = await api('/api/update/log');
+    const wasAtBottom = status.scrollHeight - status.scrollTop - status.clientHeight < 24;
     status.textContent = data.log || '';
-    status.scrollTop = status.scrollHeight;
+    if (wasAtBottom) status.scrollTop = status.scrollHeight;
     if (data.running) {
+      button.disabled = true;
+      closeButton.disabled = true;
       updatePollTimer = setTimeout(pollUpdateLog, 1000);
     } else {
+      updateRunning = false;
       button.disabled = data.success !== false;
       closeButton.disabled = false;
       if (data.success === false) {
@@ -944,6 +973,7 @@ async function pollUpdateLog() {
     }
   } catch (err) {
     status.textContent += `\n\nLog polling failed: ${err.message || err}`;
+    updateRunning = false;
     closeButton.disabled = false;
   }
 }
@@ -1055,21 +1085,46 @@ function setConnectionKey(value, qrSvg = '') {
   document.getElementById('decodedKey').textContent = decodeConnectionKey(value);
 }
 
-function showKeyPopover() {
-  if (!currentConnectionKey) return;
+function cancelHideKeyPopover() {
   if (keyPopoverTimer) {
     clearTimeout(keyPopoverTimer);
     keyPopoverTimer = null;
   }
+}
+
+function showKeyPopover() {
+  if (!currentConnectionKey) return;
+  cancelHideKeyPopover();
+  const qr = document.getElementById('connectionQr');
+  const popover = document.getElementById('connectionKeyPopover');
   document.getElementById('connectionKeyWrap').classList.add('popover-open');
+  const qrRect = qr.getBoundingClientRect();
+  const popoverRect = popover.getBoundingClientRect();
+  const margin = 12;
+  const left = Math.max(margin, Math.min(
+    qrRect.left + (qrRect.width / 2) - (popoverRect.width / 2),
+    window.innerWidth - popoverRect.width - margin
+  ));
+  let top = qrRect.bottom + 8;
+  if (top + popoverRect.height > window.innerHeight - margin) {
+    top = qrRect.top - popoverRect.height - 8;
+  }
+  if (top < margin) top = margin;
+  popover.style.left = `${left}px`;
+  popover.style.top = `${top}px`;
+}
+
+function hideKeyPopover() {
+  cancelHideKeyPopover();
+  document.getElementById('connectionKeyWrap').classList.remove('popover-open');
 }
 
 function scheduleHideKeyPopover() {
   if (keyPopoverTimer) clearTimeout(keyPopoverTimer);
   keyPopoverTimer = setTimeout(() => {
-    document.getElementById('connectionKeyWrap').classList.remove('popover-open');
+    hideKeyPopover();
     keyPopoverTimer = null;
-  }, 2500);
+  }, 1000);
 }
 
 async function copyConnectionKey() {
