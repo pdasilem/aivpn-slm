@@ -43,6 +43,13 @@
     <string name="error_profile_name_empty">Enter a name</string>
     <string name="error_profile_key_empty">Enter a connection key</string>
     <string name="error_profile_key_invalid">Invalid connection key format</string>
+    <string name="error_connection_key_prefix">Connection key must start with aivpn://</string>
+    <string name="error_connection_key_payload">Connection key payload is not valid base64url JSON</string>
+    <string name="error_connection_key_missing_field">Connection key is missing field %1$s</string>
+    <plurals name="error_connection_key_size">
+        <item quantity="one">%1$s must be %2$d byte</item>
+        <item quantity="other">%1$s must be %2$d bytes</item>
+    </plurals>
     <string name="confirm_delete_profile">Delete "%s"?</string>
     <string name="no_profiles">No saved keys. Tap + Add to create one.</string>
 
