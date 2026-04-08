@@ -655,7 +655,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
     code, textarea, pre { width: 100%; box-sizing: border-box; word-break: break-all; }
     pre { min-height: 96px; overflow: auto; white-space: pre-wrap; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; }
-    .service-row { margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border); }
     .qr { display: flex; justify-content: center; padding: 12px; background: #fff; border-radius: 8px; margin-bottom: 12px; min-height: 64px; }
     .qr:empty { display: none; }
     .qr svg { max-width: 256px; width: 100%; height: auto; }
@@ -675,8 +674,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button onclick="clearToken()">Clear token</button>
       <button onclick="toggleTheme()">Toggle theme</button>
       <a id="grafanaLink" class="button-link" href="/grafana" target="_blank">Grafana</a>
-    </div>
-    <div class="row service-row">
       <button onclick="openUpdateDialog()">Check for updates</button>
     </div>
     <div id="tokenStatus" class="muted"></div>
