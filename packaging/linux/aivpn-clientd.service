@@ -1,0 +1,21 @@
+[Unit]
+Description=AIVPN Client Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/opt/aivpn/aivpn-clientd
+Environment=AIVPN_CLIENT_PATH=/opt/aivpn/aivpn-client
+Environment=AIVPN_CLIENTD_CONFIG_DIR=/etc/aivpn/client
+Environment=AIVPN_CLIENTD_PIPE=aivpn-clientd
+Restart=on-failure
+RestartSec=2s
+
+# The helper must be privileged until TUN/routes are moved behind a narrower
+# capability or polkit-controlled helper path.
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

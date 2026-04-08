@@ -81,11 +81,33 @@
 
 ## Как поднять всё это добро
 
+### Автоматический серверный менеджер
+
+Для VPS-сценария есть интерактивный shell-скрипт:
+
+```bash
+sudo mkdir -p /opt/aivpn
+sudo chown "$USER:$USER" /opt/aivpn
+git clone https://github.com/pdasilem/aivpn-slm.git /opt/aivpn
+cd /opt/aivpn
+./install.sh
+```
+
+Он:
+
+- установить AIVPN через Docker Compose;
+- автоматически включает IP forwarding и добавляет NAT MASQUERADE через iptables;
+- обновить AIVPN из git с сохранением `config/`;
+- удалить AIVPN с выбором, сохранять ли настройки;
+- проверить firewall/Tailscale/UFW/firewalld/nftables/iptables.
+
+Во время установки скрипт предложит публичный адрес сервера для клиентских ключей, запишет его в `.env` как `AIVPN_SERVER_IP`, спросит, генерировать ли admin token, затем запустит сервер, admin UI, Prometheus и Grafana. Если токен включен, его надо вставить в поле `Admin token` в web UI и нажать `Use token`.
+
 ### 1. Клонируем репозиторий
 
 ```bash
-git clone https://github.com/infosave2007/aivpn.git
-cd aivpn
+git clone https://github.com/pdasilem/aivpn-slm.git
+cd aivpn-slm
 ```
 
 ### 2. Сборка (потребуется Rust 1.75+)
@@ -104,6 +126,7 @@ cargo build --release
 #### Вариант А: Docker (рекомендуется)
 
 Самый простой способ — всё настроено в `docker-compose.yml`.
+Если запускаете Docker Compose вручную, обязательно задайте публичный endpoint сервера в `.env`: именно он попадет в клиентские connection keys.
 
 ```bash
 # Генерируем ключ сервера
@@ -111,12 +134,14 @@ mkdir -p config
 openssl rand 32 > config/server.key
 chmod 600 config/server.key
 
-# Включаем NAT (нужен для доступа в интернет через VPN)
+# Включаем NAT (нужен для доступа в интернет через VPN). install.sh делает это автоматически,
+# но при ручном Docker Compose запуске это надо сделать вручную.
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
 
-# Собираем и запускаем
-docker compose up -d aivpn-server
+# Собираем и запускаем. Замените IP на публичный IP или DNS вашего сервера.
+echo "AIVPN_SERVER_IP=ВАШ_ПУБЛИЧНЫЙ_IP:443" > .env
+docker compose up -d --build aivpn-server aivpn-admin-web prometheus grafana
 ```
 
 > Контейнер запускается с `network_mode: "host"` и монтирует `./config` → `/etc/aivpn` внутри контейнера.

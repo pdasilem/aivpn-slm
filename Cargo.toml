@@ -3,12 +3,16 @@ members = [
     "aivpn-common",
     "aivpn-client",
     "aivpn-server",
+    "aivpn-admin",
+    "aivpn-admin-web",
     "aivpn-android-core",
 ]
 default-members = [
     "aivpn-common",
     "aivpn-client",
     "aivpn-server",
+    "aivpn-admin",
+    "aivpn-admin-web",
 ]
 resolver = "2"
 

@@ -13,6 +13,8 @@ COPY Cargo.toml ./
 COPY aivpn-common aivpn-common/
 COPY aivpn-client aivpn-client/
 COPY aivpn-server aivpn-server/
+COPY aivpn-admin aivpn-admin/
+COPY aivpn-admin-web aivpn-admin-web/
 COPY aivpn-android-core aivpn-android-core/
 
 RUN cargo build --release --bin aivpn-client

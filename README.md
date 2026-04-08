@@ -102,11 +102,25 @@ We didn't drag a 400 MB LLM into the project that would eat all the RAM on a che
 
 ## Getting Started
 
+### Server Manager
+
+For VPS installs, use the interactive server manager:
+
+```bash
+sudo mkdir -p /opt/aivpn
+sudo chown "$USER:$USER" /opt/aivpn
+git clone https://github.com/pdasilem/aivpn-slm.git /opt/aivpn
+cd /opt/aivpn
+./install.sh
+```
+
+It can install through Docker Compose, enable IP forwarding, add the required iptables NAT MASQUERADE rule, update from git while preserving `config/`, uninstall with an option to keep settings, write `AIVPN_SERVER_IP` into `.env`, generate the admin UI token, start Prometheus/Grafana, and run firewall/Tailscale diagnostics.
+
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/infosave2007/aivpn.git
-cd aivpn
+git clone https://github.com/pdasilem/aivpn-slm.git
+cd aivpn-slm
 ```
 
 ### 2. Build (requires Rust 1.75+)
@@ -125,6 +139,7 @@ cargo build --release
 #### Option A: Docker (recommended)
 
 The easiest way — everything is preconfigured in `docker-compose.yml`.
+If you start Docker Compose manually, set the public server endpoint in `.env`; this exact value is embedded into client connection keys.
 
 ```bash
 # Generate server key
@@ -132,12 +147,14 @@ mkdir -p config
 openssl rand 32 > config/server.key
 chmod 600 config/server.key
 
-# Enable NAT (required for internet access from VPN)
+# Enable NAT (required for internet access from VPN). install.sh does this automatically,
+# but manual Docker Compose starts still need it.
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
 
-# Build and start
-docker compose up -d aivpn-server
+# Build and start. Replace the placeholder with your server public IP or DNS name.
+echo "AIVPN_SERVER_IP=YOUR_PUBLIC_IP:443" > .env
+docker compose up -d --build aivpn-server aivpn-admin-web prometheus grafana
 ```
 
 > The container runs with `network_mode: "host"` and mounts `./config` → `/etc/aivpn` inside the container.

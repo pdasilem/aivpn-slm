@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="background">#FF121218</color>
-    <color name="surface">#FF1E1E2A</color>
+    <color name="background">#FFF4F7FA</color>
+    <color name="surface">#FFFFFFFF</color>
     <color name="accent">#FF6C5CE7</color>
     <color name="disconnect">#FFE74C3C</color>
-    <color name="text_primary">#FFFFFFFF</color>
-    <color name="text_secondary">#FFB0B0BF</color>
+    <color name="text_primary">#FF14202A</color>
+    <color name="text_secondary">#FF5F6F7E</color>
     <color name="green">#FF2ECC71</color>
-    <color name="grey">#FF555566</color>
+    <color name="grey">#FFCAD5DF</color>
 </resources>

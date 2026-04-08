@@ -1,0 +1,19 @@
+[package]
+name = "aivpn-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aivpn-admin"
+path = "src/main.rs"
+
+[dependencies]
+aivpn-common = { path = "../aivpn-common" }
+aivpn-server = { path = "../aivpn-server" }
+
+base64 = "0.22"
+chrono.workspace = true
+clap = { version = "4.4", features = ["derive", "env"] }
+serde.workspace = true
+serde_json.workspace = true

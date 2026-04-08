@@ -1,14 +1,16 @@
 //! AIVPN Server
-//! 
+//!
 //! Main server entry point
 
-use tracing::{info, error};
+use std::sync::Arc;
+
 use tracing_subscriber::{self, EnvFilter};
 
 use clap::Parser;
 
-use aivpn_common::error::Result;
 use crate::gateway::{Gateway, GatewayConfig};
+use crate::metrics::MetricsCollector;
+use aivpn_common::error::Result;
 
 /// AIVPN Server - Censorship-resistant VPN gateway
 #[derive(Parser, Debug)]
@@ -58,6 +60,11 @@ pub struct ServerArgs {
     /// Per-IP packet rate limit for incoming UDP traffic.
     #[arg(long, env = "AIVPN_PER_IP_PPS_LIMIT", default_value_t = 50000)]
     pub per_ip_pps_limit: u64,
+
+    /// Optional Prometheus metrics HTTP listen address, for example 127.0.0.1:9090.
+    /// Requires building with --features metrics.
+    #[arg(long, env = "AIVPN_METRICS_LISTEN")]
+    pub metrics_listen: Option<String>,
 }
 
 /// AIVPN Server instance
@@ -71,7 +78,12 @@ impl AivpnServer {
         let gateway = Gateway::new(config)?;
         Ok(Self { gateway })
     }
-    
+
+    /// Get metrics collector reference.
+    pub fn metrics(&self) -> Arc<MetricsCollector> {
+        self.gateway.metrics().clone()
+    }
+
     /// Run the server
     pub async fn run(&mut self) -> Result<()> {
         self.gateway.run().await
@@ -84,7 +96,7 @@ pub fn init_logging() {
         .with_env_filter(
             EnvFilter::from_default_env()
                 .add_directive("aivpn_server=info".parse().unwrap())
-                .add_directive("aivpn_common=info".parse().unwrap())
+                .add_directive("aivpn_common=info".parse().unwrap()),
         )
         .init();
 }

@@ -14,7 +14,7 @@
         android:padding="24dp"
         android:gravity="center_horizontal">
 
-        <!-- Header row: title + language toggle -->
+        <!-- Header row: title + theme toggle -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -47,11 +47,11 @@
             </LinearLayout>
 
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnLanguage"
+                android:id="@+id/btnTheme"
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="wrap_content"
                 android:layout_height="40dp"
-                android:text="EN | RU"
+                android:text="@string/btn_theme"
                 android:textSize="12sp"
                 android:textColor="@color/text_secondary"
                 app:cornerRadius="20dp"

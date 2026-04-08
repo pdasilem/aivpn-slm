@@ -54,13 +54,13 @@ object SecureStorage {
         return loadString(context, "connection_key")
     }
 
-    // Language preference
-    fun saveLanguage(context: Context, lang: String) {
-        saveString(context, "language", lang)
+    // Theme preference
+    fun saveTheme(context: Context, theme: String) {
+        saveString(context, "theme", theme)
     }
 
-    fun loadLanguage(context: Context): String {
-        return loadString(context, "language", "en")
+    fun loadTheme(context: Context): String {
+        return loadString(context, "theme", "dark")
     }
 
     // ──────────── Multi-profile management ────────────

@@ -2,6 +2,7 @@ package com.aivpn.client
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
@@ -16,14 +17,13 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
-import androidx.core.os.LocaleListCompat
 import com.aivpn.client.databinding.ActivityMainBinding
 import org.json.JSONObject
 import java.util.UUID
 
 /**
  * Main screen — server address, public key, connect/disconnect button,
- * connection timer, traffic stats, and EN/RU language toggle.
+ * connection timer, traffic stats, and theme toggle.
  *
  * v0.3.0: Uses EncryptedSharedPreferences for secure key storage.
  */
@@ -34,6 +34,7 @@ class MainActivity : AppCompatActivity() {
 
     private var profiles = mutableListOf<SecureStorage.ConnectionProfile>()
     private var activeProfileId: String? = null
+    private var pendingScanTarget: EditText? = null
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -43,6 +44,21 @@ class MainActivity : AppCompatActivity() {
         } else {
             Toast.makeText(this, getString(R.string.error_vpn_denied), Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private val qrScanLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+        val value = result.data?.getStringExtra("SCAN_RESULT")
+            ?: result.data?.getStringExtra("com.google.zxing.client.android.SCAN.RESULT")
+            ?: result.data?.dataString
+        if (value.isNullOrBlank()) {
+            Toast.makeText(this, getString(R.string.error_qr_empty), Toast.LENGTH_SHORT).show()
+            return@registerForActivityResult
+        }
+        pendingScanTarget?.setText(value.trim())
+        pendingScanTarget?.setSelection(pendingScanTarget?.text?.length ?: 0)
     }
 
     // Connection timer
@@ -64,6 +80,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyTheme()
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -89,15 +106,14 @@ class MainActivity : AppCompatActivity() {
 
         renderProfiles()
 
-        // Update language button label
-        updateLanguageButton()
+        updateThemeButton()
 
         binding.btnConnect.setOnClickListener {
             if (isConnected) disconnect() else connect()
         }
 
-        binding.btnLanguage.setOnClickListener {
-            toggleLanguage()
+        binding.btnTheme.setOnClickListener {
+            toggleTheme()
         }
 
         binding.btnAddProfile.setOnClickListener {
@@ -248,7 +264,7 @@ class MainActivity : AppCompatActivity() {
         else
             getString(R.string.dialog_add_profile)
 
-        AlertDialog.Builder(this, R.style.Theme_AIVPN_Dialog)
+        val dialog = AlertDialog.Builder(this, R.style.Theme_AIVPN_Dialog)
             .setTitle(title)
             .setView(layout)
             .setPositiveButton(getString(R.string.btn_save)) { _, _ ->
@@ -288,7 +304,25 @@ class MainActivity : AppCompatActivity() {
                 renderProfiles()
             }
             .setNegativeButton(getString(R.string.btn_cancel), null)
+            .setNeutralButton(getString(R.string.btn_scan), null)
             .show()
+
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+            pendingScanTarget = keyInput
+            launchQrScanner()
+        }
+    }
+
+    private fun launchQrScanner() {
+        val intent = Intent("com.google.zxing.client.android.SCAN").apply {
+            putExtra("SCAN_MODE", "QR_CODE_MODE")
+            putExtra("PROMPT_MESSAGE", "Scan AIVPN connection QR")
+        }
+        try {
+            qrScanLauncher.launch(intent)
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, getString(R.string.error_no_qr_scanner), Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun confirmDeleteProfile(profile: SecureStorage.ConnectionProfile) {
@@ -484,26 +518,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun toggleLanguage() {
-        val currentLang = SecureStorage.loadLanguage(this)
-        val newLang = if (currentLang == "en") "ru" else "en"
-
-        SecureStorage.saveLanguage(this, newLang)
-
-        val localeList = LocaleListCompat.forLanguageTags(newLang)
-        AppCompatDelegate.setApplicationLocales(localeList)
+    private fun applyTheme() {
+        val mode = if (SecureStorage.loadTheme(this) == "light") {
+            AppCompatDelegate.MODE_NIGHT_NO
+        } else {
+            AppCompatDelegate.MODE_NIGHT_YES
+        }
+        AppCompatDelegate.setDefaultNightMode(mode)
     }
 
-    private fun updateLanguageButton() {
-        // Apply saved language on startup
-        val savedLang = SecureStorage.loadLanguage(this)
-        if (savedLang != "en") {
-            val localeList = LocaleListCompat.forLanguageTags(savedLang)
-            AppCompatDelegate.setApplicationLocales(localeList)
-        }
+    private fun toggleTheme() {
+        val next = if (SecureStorage.loadTheme(this) == "light") "dark" else "light"
+        SecureStorage.saveTheme(this, next)
+        applyTheme()
+        updateThemeButton()
+    }
 
-        val currentLang = savedLang.uppercase()
-        binding.btnLanguage.text = if (currentLang == "EN") "EN → RU" else "RU → EN"
+    private fun updateThemeButton() {
+        binding.btnTheme.text = if (SecureStorage.loadTheme(this) == "light") "Dark" else "Light"
     }
 
     private fun formatBytes(bytes: Long): String {

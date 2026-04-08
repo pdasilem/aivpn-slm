@@ -1,14 +1,14 @@
 //! AIVPN Server Binary
 
-use aivpn_server::{AivpnServer, ServerArgs, ClientDatabase};
+use aivpn_common::crypto;
 use aivpn_server::gateway::GatewayConfig;
 use aivpn_server::neural::NeuralConfig;
-use aivpn_common::crypto;
-use tracing::{info, error};
+use aivpn_server::{AivpnServer, ClientDatabase, ServerArgs};
 use clap::Parser;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() {
@@ -45,9 +45,7 @@ async fn main() {
 
     // Initialize logging (only for server mode)
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     info!("AIVPN Server v{}", env!("CARGO_PKG_VERSION"));
@@ -57,11 +55,10 @@ async fn main() {
 
     // Load server private key from file if provided (HIGH-11)
     let server_private_key = if let Some(ref key_file) = args.key_file {
-        let key_data = std::fs::read(key_file)
-            .unwrap_or_else(|e| {
-                error!("Failed to read key file '{}': {}", key_file, e);
-                std::process::exit(1);
-            });
+        let key_data = std::fs::read(key_file).unwrap_or_else(|e| {
+            error!("Failed to read key file '{}': {}", key_file, e);
+            std::process::exit(1);
+        });
         if key_data.len() != 32 {
             error!("Key file must be exactly 32 bytes, got {}", key_data.len());
             std::process::exit(1);
@@ -71,7 +68,13 @@ async fn main() {
         info!("Loaded server key from file");
         let kp = crypto::KeyPair::from_private_key(key);
         let pub_bytes = kp.public_key_bytes();
-        info!("Server public key (hex): {}", pub_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+        info!(
+            "Server public key (hex): {}",
+            pub_bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
         key
     } else {
         info!("No --key-file provided, server key will be ephemeral");
@@ -103,6 +106,30 @@ async fn main() {
     match AivpnServer::new(config) {
         Ok(mut server) => {
             info!("Server initialized successfully");
+
+            if let Some(metrics_listen) = args.metrics_listen.as_deref() {
+                #[cfg(feature = "metrics")]
+                {
+                    let metrics = server.metrics();
+                    let metrics_listen = metrics_listen.to_string();
+                    tokio::spawn(async move {
+                        if let Err(err) =
+                            aivpn_server::metrics::serve_metrics(&metrics_listen, metrics).await
+                        {
+                            tracing::error!("Metrics endpoint failed: {}", err);
+                        }
+                    });
+                }
+
+                #[cfg(not(feature = "metrics"))]
+                {
+                    tracing::warn!(
+                        "--metrics-listen={} ignored because aivpn-server was built without the 'metrics' feature",
+                        metrics_listen
+                    );
+                }
+            }
+
             if let Err(e) = server.run().await {
                 error!("Server error: {}", e);
                 std::process::exit(1);
@@ -118,7 +145,9 @@ async fn main() {
 fn load_server_public_key(args: &ServerArgs) -> Option<[u8; 32]> {
     args.key_file.as_ref().and_then(|key_file| {
         let key_data = std::fs::read(key_file).ok()?;
-        if key_data.len() != 32 { return None; }
+        if key_data.len() != 32 {
+            return None;
+        }
         let mut key = [0u8; 32];
         key.copy_from_slice(&key_data);
         let kp = crypto::KeyPair::from_private_key(key);
@@ -127,7 +156,13 @@ fn load_server_public_key(args: &ServerArgs) -> Option<[u8; 32]> {
 }
 
 /// Build a connection key: aivpn://BASE64({"s":"host:port","k":"...","p":"...","i":"..."})
-fn build_connection_key(args: &ServerArgs, server_ip: &str, server_pub_b64: &str, psk_b64: &str, vpn_ip: &str) -> String {
+fn build_connection_key(
+    args: &ServerArgs,
+    server_ip: &str,
+    server_pub_b64: &str,
+    psk_b64: &str,
+    vpn_ip: &str,
+) -> String {
     use base64::Engine;
     let server_addr = build_connection_server_addr(args, server_ip);
     let json = serde_json::json!({
@@ -169,7 +204,13 @@ fn handle_add_client(db: &ClientDatabase, name: &str, args: &ServerArgs) {
 
             if let (Some(pub_key), Some(ref server_ip)) = (server_pub, &args.server_ip) {
                 let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_key);
-                let conn_key = build_connection_key(args, server_ip, &pub_b64, &psk_b64, &client.vpn_ip.to_string());
+                let conn_key = build_connection_key(
+                    args,
+                    server_ip,
+                    &pub_b64,
+                    &psk_b64,
+                    &client.vpn_ip.to_string(),
+                );
                 println!("══ Connection Key (paste into app) ══");
                 println!();
                 println!("{}", conn_key);
@@ -193,21 +234,20 @@ fn handle_add_client(db: &ClientDatabase, name: &str, args: &ServerArgs) {
 
 fn handle_remove_client(db: &ClientDatabase, id: &str) {
     // Allow removal by name too
-    let actual_id = db.list_clients()
+    let actual_id = db
+        .list_clients()
         .iter()
         .find(|c| c.id == id || c.name == id)
         .map(|c| c.id.clone());
 
     match actual_id {
-        Some(cid) => {
-            match db.remove_client(&cid) {
-                Ok(()) => println!("✅ Client '{}' removed.", id),
-                Err(e) => {
-                    eprintln!("❌ Failed to remove: {}", e);
-                    std::process::exit(1);
-                }
+        Some(cid) => match db.remove_client(&cid) {
+            Ok(()) => println!("✅ Client '{}' removed.", id),
+            Err(e) => {
+                eprintln!("❌ Failed to remove: {}", e);
+                std::process::exit(1);
             }
-        }
+        },
         None => {
             eprintln!("❌ Client '{}' not found.", id);
             std::process::exit(1);
@@ -220,31 +260,40 @@ fn handle_list_clients(db: &ClientDatabase) {
     if clients.is_empty() {
         println!("No registered clients.");
         println!();
-        println!("Add a client: aivpn-server --add-client \"Phone\" --key-file /etc/aivpn/server.key");
+        println!(
+            "Add a client: aivpn-server --add-client \"Phone\" --key-file /etc/aivpn/server.key"
+        );
         return;
     }
 
-    println!("{:<18} {:<20} {:<12} {:<8} {:<12} {:<12} {}",
-        "ID", "NAME", "VPN IP", "STATUS", "UPLOAD", "DOWNLOAD", "LAST SEEN");
+    println!(
+        "{:<18} {:<20} {:<12} {:<8} {:<12} {:<12} {}",
+        "ID", "NAME", "VPN IP", "STATUS", "UPLOAD", "DOWNLOAD", "LAST SEEN"
+    );
     println!("{}", "-".repeat(100));
 
     for client in &clients {
         let status = if client.enabled { "active" } else { "disabled" };
         let upload = format_bytes(client.stats.bytes_out);
         let download = format_bytes(client.stats.bytes_in);
-        let last_seen = client.stats.last_connected
+        let last_seen = client
+            .stats
+            .last_connected
             .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "never".to_string());
 
-        println!("{:<18} {:<20} {:<12} {:<8} {:<12} {:<12} {}",
-            client.id, client.name, client.vpn_ip, status, upload, download, last_seen);
+        println!(
+            "{:<18} {:<20} {:<12} {:<8} {:<12} {:<12} {}",
+            client.id, client.name, client.vpn_ip, status, upload, download, last_seen
+        );
     }
     println!();
     println!("Total: {} client(s)", clients.len());
 }
 
 fn handle_show_client(db: &ClientDatabase, id: &str, args: &ServerArgs) {
-    let client = db.list_clients()
+    let client = db
+        .list_clients()
         .into_iter()
         .find(|c| c.id == id || c.name == id);
 
@@ -256,19 +305,35 @@ fn handle_show_client(db: &ClientDatabase, id: &str, args: &ServerArgs) {
 
             println!("Client: {} ({})", client.name, client.id);
             println!("  VPN IP:      {}", client.vpn_ip);
-            println!("  Status:      {}", if client.enabled { "active" } else { "disabled" });
-            println!("  Created:     {}", client.created_at.format("%Y-%m-%d %H:%M"));
+            println!(
+                "  Status:      {}",
+                if client.enabled { "active" } else { "disabled" }
+            );
+            println!(
+                "  Created:     {}",
+                client.created_at.format("%Y-%m-%d %H:%M")
+            );
             println!("  Connections: {}", client.stats.total_connections);
             println!("  Upload:      {}", format_bytes(client.stats.bytes_out));
             println!("  Download:    {}", format_bytes(client.stats.bytes_in));
-            println!("  Last seen:   {}",
-                client.stats.last_connected
+            println!(
+                "  Last seen:   {}",
+                client
+                    .stats
+                    .last_connected
                     .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_else(|| "never".to_string()));
+                    .unwrap_or_else(|| "never".to_string())
+            );
 
             if let (Some(pub_key), Some(ref server_ip)) = (server_pub, &args.server_ip) {
                 let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_key);
-                let conn_key = build_connection_key(args, server_ip, &pub_b64, &psk_b64, &client.vpn_ip.to_string());
+                let conn_key = build_connection_key(
+                    args,
+                    server_ip,
+                    &pub_b64,
+                    &psk_b64,
+                    &client.vpn_ip.to_string(),
+                );
                 println!();
                 println!("══ Connection Key ══");
                 println!();
@@ -315,19 +380,26 @@ mod tests {
             show_client: None,
             server_ip: None,
             per_ip_pps_limit: 1000,
+            metrics_listen: None,
         }
     }
 
     #[test]
     fn build_connection_server_addr_keeps_explicit_port() {
         let args = test_args("0.0.0.0:443");
-        assert_eq!(build_connection_server_addr(&args, "203.0.113.10:8443"), "203.0.113.10:8443");
+        assert_eq!(
+            build_connection_server_addr(&args, "203.0.113.10:8443"),
+            "203.0.113.10:8443"
+        );
     }
 
     #[test]
     fn build_connection_server_addr_adds_listen_port_once() {
         let args = test_args("0.0.0.0:443");
-        assert_eq!(build_connection_server_addr(&args, "203.0.113.10"), "203.0.113.10:443");
+        assert_eq!(
+            build_connection_server_addr(&args, "203.0.113.10"),
+            "203.0.113.10:443"
+        );
     }
 
     #[test]

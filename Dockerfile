@@ -14,13 +14,18 @@ RUN apt-get update && apt-get install -y \
 
 # Copy workspace
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY aivpn-common aivpn-common/
 COPY aivpn-server aivpn-server/
-COPY aivpn-client aivpn-client/
-COPY aivpn-android-core aivpn-android-core/
+COPY aivpn-admin aivpn-admin/
+COPY aivpn-admin-web aivpn-admin-web/
 
-# Build in release mode (Cargo.lock is auto-generated if missing)
-RUN cargo build --release --bin aivpn-server
+# Prune client-only crates from the server image build workspace.
+RUN sed -e '/"aivpn-client"/d' -e '/"aivpn-android-core"/d' Cargo.toml > Cargo.toml.pruned && \
+    mv Cargo.toml.pruned Cargo.toml
+
+# Build in release mode
+RUN cargo build --release --features metrics --bin aivpn-server --bin aivpn-admin --bin aivpn-admin-web
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -41,17 +46,18 @@ WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /app/target/release/aivpn-server /usr/local/bin/aivpn-server
+COPY --from=builder /app/target/release/aivpn-admin /usr/local/bin/aivpn-admin
+COPY --from=builder /app/target/release/aivpn-admin-web /usr/local/bin/aivpn-admin-web
 
 # Create config directory and TUN device node
 RUN mkdir -p /etc/aivpn /dev/net && \
     mknod /dev/net/tun c 10 200 2>/dev/null || true && \
     chmod 600 /dev/net/tun
 
-# Copy example config
-COPY config/server.json.example /etc/aivpn/server.json
-
-# Expose port
+# Expose ports
 EXPOSE 443/udp
+EXPOSE 9100/tcp
+EXPOSE 27449/tcp
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \

@@ -124,7 +124,10 @@ impl ClientDatabase {
         chacha20poly1305::aead::OsRng.fill_bytes(&mut id_bytes);
         chacha20poly1305::aead::OsRng.fill_bytes(&mut psk);
 
-        let id = id_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let id = id_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
 
         let client = ClientConfig {
             id,
@@ -154,6 +157,52 @@ impl ClientDatabase {
         drop(data);
         self.save()?;
         Ok(())
+    }
+
+    /// Rename a client by ID.
+    pub fn rename_client(&self, client_id: &str, new_name: &str) -> Result<ClientConfig> {
+        let mut data = self.data.write();
+
+        if data
+            .clients
+            .iter()
+            .any(|c| c.id != client_id && c.name == new_name)
+        {
+            return Err(Error::Session(format!(
+                "Client '{}' already exists",
+                new_name
+            )));
+        }
+
+        let client = data
+            .clients
+            .iter_mut()
+            .find(|c| c.id == client_id)
+            .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
+
+        client.name = new_name.to_string();
+        let updated = client.clone();
+        drop(data);
+
+        self.save()?;
+        Ok(updated)
+    }
+
+    /// Enable or disable a client by ID.
+    pub fn set_client_enabled(&self, client_id: &str, enabled: bool) -> Result<ClientConfig> {
+        let mut data = self.data.write();
+        let client = data
+            .clients
+            .iter_mut()
+            .find(|c| c.id == client_id)
+            .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
+
+        client.enabled = enabled;
+        let updated = client.clone();
+        drop(data);
+
+        self.save()?;
+        Ok(updated)
     }
 
     /// Get all clients
@@ -230,7 +279,10 @@ impl ClientDatabase {
 
         match self.reload_from_disk() {
             Ok(true) => {
-                info!("Client database reloaded from disk ({} clients)", self.list_clients().len());
+                info!(
+                    "Client database reloaded from disk ({} clients)",
+                    self.list_clients().len()
+                );
                 true
             }
             Ok(false) => false,
@@ -252,8 +304,10 @@ impl ClientDatabase {
         let mut data = self.data.write();
 
         // Check if anything actually changed (compare client count and IDs)
-        let old_ids: std::collections::HashSet<String> = data.clients.iter().map(|c| c.id.clone()).collect();
-        let new_ids: std::collections::HashSet<String> = new_data.clients.iter().map(|c| c.id.clone()).collect();
+        let old_ids: std::collections::HashSet<String> =
+            data.clients.iter().map(|c| c.id.clone()).collect();
+        let new_ids: std::collections::HashSet<String> =
+            new_data.clients.iter().map(|c| c.id.clone()).collect();
         let changed = old_ids != new_ids;
 
         if !changed {
@@ -261,18 +315,23 @@ impl ClientDatabase {
         }
 
         // Build a map of existing stats by client ID
-        let mut stats_map: std::collections::HashMap<String, ClientStats> = std::collections::HashMap::new();
+        let mut stats_map: std::collections::HashMap<String, ClientStats> =
+            std::collections::HashMap::new();
         for client in &data.clients {
             stats_map.insert(client.id.clone(), client.stats.clone());
         }
 
         // Replace clients list, preserving stats for existing clients
-        data.clients = new_data.clients.into_iter().map(|mut c| {
-            if let Some(saved_stats) = stats_map.get(&c.id) {
-                c.stats = saved_stats.clone();
-            }
-            c
-        }).collect();
+        data.clients = new_data
+            .clients
+            .into_iter()
+            .map(|mut c| {
+                if let Some(saved_stats) = stats_map.get(&c.id) {
+                    c.stats = saved_stats.clone();
+                }
+                c
+            })
+            .collect();
         data.next_octet = new_data.next_octet;
 
         Ok(true)
@@ -283,13 +342,18 @@ impl ClientDatabase {
 mod base64_bytes {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(
+        bytes: &[u8; 32],
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
         b64.serialize(serializer)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<[u8; 32], D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<[u8; 32], D::Error> {
         use base64::Engine;
         let s = String::deserialize(deserializer)?;
         let bytes = base64::engine::general_purpose::STANDARD

@@ -1,0 +1,116 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Aivpn.Ui.ViewModels"
+        xmlns:models="using:Aivpn.Ui.Models"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        x:Class="Aivpn.Ui.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Icon="/Assets/avalonia-logo.ico"
+        Title="AIVPN"
+        Width="960"
+        Height="640"
+        MinWidth="760"
+        MinHeight="520">
+
+    <Design.DataContext>
+        <vm:MainWindowViewModel/>
+    </Design.DataContext>
+
+    <Grid RowDefinitions="Auto,*" Background="#101418">
+        <Border Grid.Row="0" Padding="18,14" BorderBrush="#26323D" BorderThickness="0,0,0,1">
+            <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Spacing="2">
+                    <TextBlock Text="AIVPN" FontSize="22" FontWeight="SemiBold" Foreground="#F3F6FA"/>
+                    <TextBlock Text="Client profiles and tunnel control" Foreground="#9AA8B5"/>
+                </StackPanel>
+                <Border Grid.Column="1" Padding="10,6" CornerRadius="8" Background="#18212A">
+                    <TextBlock Text="{Binding StatusText}" Foreground="#D8E1EA"/>
+                </Border>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1" ColumnDefinitions="330,*" Margin="18" ColumnSpacing="18">
+            <Border Grid.Column="0" CornerRadius="8" Background="#151B22" BorderBrush="#26323D" BorderThickness="1" Padding="14">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="12">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <TextBlock Text="Connections" FontSize="18" FontWeight="SemiBold" Foreground="#F3F6FA"/>
+                        <Button Grid.Column="1" Content="New" Command="{Binding NewProfileCommand}"/>
+                    </Grid>
+
+                    <ListBox Grid.Row="1"
+                             ItemsSource="{Binding Profiles}"
+                             SelectedItem="{Binding SelectedProfile}"
+                             Background="#11171D"
+                             BorderBrush="#26323D">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="models:ConnectionProfile">
+                                <StackPanel Spacing="4" Margin="4">
+                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="#F3F6FA"/>
+                                    <TextBlock Text="{Binding DisplayEndpoint}" FontSize="12" Foreground="#9AA8B5"/>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <StackPanel Grid.Row="2" Spacing="10">
+                        <TextBlock Text="Profile" FontWeight="SemiBold" Foreground="#F3F6FA"/>
+                        <TextBox PlaceholderText="Name" Text="{Binding ProfileName}"/>
+                        <TextBox PlaceholderText="aivpn://..." Text="{Binding ConnectionKey}" AcceptsReturn="True" Height="82"/>
+                        <CheckBox Content="Full tunnel" IsChecked="{Binding FullTunnel}"/>
+                        <Grid ColumnDefinitions="*,*" ColumnSpacing="8">
+                            <Button Content="Save" Command="{Binding SaveProfileCommand}"/>
+                            <Button Grid.Column="1" Content="Delete" Command="{Binding DeleteProfileCommand}"/>
+                        </Grid>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Border Grid.Column="1" CornerRadius="8" Background="#151B22" BorderBrush="#26323D" BorderThickness="1" Padding="18">
+                <Grid RowDefinitions="Auto,Auto,*,Auto" RowSpacing="16">
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Tunnel" FontSize="18" FontWeight="SemiBold" Foreground="#F3F6FA"/>
+                        <TextBlock Text="{Binding SelectedProfile.DisplayEndpoint, FallbackValue=No profile selected}" Foreground="#9AA8B5"/>
+                    </StackPanel>
+
+                    <Grid Grid.Row="1" ColumnDefinitions="*,*,*" ColumnSpacing="12">
+                        <Border Padding="12" CornerRadius="8" Background="#11171D">
+                            <StackPanel>
+                                <TextBlock Text="Status" Foreground="#9AA8B5"/>
+                                <TextBlock Text="{Binding StatusText}" FontSize="20" Foreground="#F3F6FA"/>
+                            </StackPanel>
+                        </Border>
+                        <Border Grid.Column="1" Padding="12" CornerRadius="8" Background="#11171D">
+                            <StackPanel>
+                                <TextBlock Text="Upload" Foreground="#9AA8B5"/>
+                                <TextBlock Text="{Binding BytesSent}" FontSize="20" Foreground="#F3F6FA"/>
+                            </StackPanel>
+                        </Border>
+                        <Border Grid.Column="2" Padding="12" CornerRadius="8" Background="#11171D">
+                            <StackPanel>
+                                <TextBlock Text="Download" Foreground="#9AA8B5"/>
+                                <TextBlock Text="{Binding BytesReceived}" FontSize="20" Foreground="#F3F6FA"/>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+
+                    <TextBox Grid.Row="2"
+                             Text="{Binding LogText}"
+                             IsReadOnly="True"
+                             AcceptsReturn="True"
+                             TextWrapping="Wrap"
+                             Background="#11171D"
+                             BorderBrush="#26323D"/>
+
+                    <Grid Grid.Row="3" ColumnDefinitions="*,*,*" ColumnSpacing="10">
+                        <Button Content="Connect" Command="{Binding ConnectCommand}"/>
+                        <Button Grid.Column="1" Content="Disconnect" Command="{Binding DisconnectCommand}"/>
+                        <Button Grid.Column="2" Content="Refresh" Command="{Binding RefreshStatusCommand}"/>
+                    </Grid>
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
+
+</Window>

@@ -1,7 +1,6 @@
 services:
   # AIVPN Server
   aivpn-server:
-    image: aivpn-server:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -21,6 +20,15 @@ services:
     environment:
       - RUST_LOG=info
       - RUST_BACKTRACE=1
+    command:
+      - "--listen"
+      - "0.0.0.0:443"
+      - "--key-file"
+      - "/etc/aivpn/server.key"
+      - "--clients-db"
+      - "/etc/aivpn/clients.json"
+      - "--metrics-listen"
+      - "0.0.0.0:9100"
     volumes:
       - ./config:/etc/aivpn
     logging:
@@ -32,12 +40,44 @@ services:
       - "com.aivpn.service=gateway"
       - "com.aivpn.version=0.3.0"
 
-  # Prometheus (optional monitoring)
+  # Admin Web UI (management via aivpn-admin CLI)
+  aivpn-admin-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/aivpn-admin-web"]
+    command:
+      - "--bind"
+      - "0.0.0.0:27449"
+      - "--admin-bin"
+      - "/usr/local/bin/aivpn-admin"
+      - "--clients-db"
+      - "/etc/aivpn/clients.json"
+      - "--key-file"
+      - "/etc/aivpn/server.key"
+      - "--server-ip"
+      - "${AIVPN_SERVER_IP:?Set AIVPN_SERVER_IP in .env, for example 5.152.13.186:443}"
+      - "--token-file"
+      - "/etc/aivpn/admin.token"
+    environment:
+      - AIVPN_ADMIN_TOKEN=${AIVPN_ADMIN_TOKEN:-}
+    volumes:
+      - ./config:/etc/aivpn
+    ports:
+      - "27449:27449"
+    labels:
+      - "com.aivpn.service=admin-web"
+      - "com.aivpn.version=0.3.0"
+
+  # Prometheus
   prometheus:
     image: prom/prometheus:latest
     restart: unless-stopped
     ports:
       - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -48,10 +88,8 @@ services:
       - '--web.console.templates=/usr/share/prometheus/consoles'
     networks:
       - aivpn
-    profiles:
-      - monitoring
 
-  # Grafana (optional visualization)
+  # Grafana
   grafana:
     image: grafana/grafana:latest
     restart: unless-stopped
@@ -62,14 +100,12 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
     networks:
       - aivpn
     depends_on:
       - prometheus
-    profiles:
-      - monitoring
 
 volumes:
   prometheus_data:

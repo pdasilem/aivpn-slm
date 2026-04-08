@@ -10,6 +10,8 @@ Cargo.lock
 *.so
 *.dylib
 *.dll
+**/bin/
+**/obj/
 
 # IDE
 .idea/
@@ -22,9 +24,8 @@ Cargo.lock
 # Logs
 *.log
 
-# Config (keep templates, ignore actual configs)
-config/*.json
-!config/*.example.json
+# Runtime config
+config/
 
 # Keys (never commit keys!)
 *.pem

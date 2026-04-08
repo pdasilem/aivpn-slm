@@ -1,6 +1,3 @@
-# Docker Compose для тестирования AIVPN (сервер + клиент в одной bridge-сети)
-version: "3.8"
-
 services:
   aivpn-server:
     build:
