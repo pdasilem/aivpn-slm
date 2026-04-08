@@ -4,9 +4,10 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -60,6 +61,15 @@ struct Args {
 struct AppState {
     args: Args,
     token: Mutex<Option<String>>,
+    update_job: Arc<Mutex<UpdateJob>>,
+}
+
+#[derive(Debug, Default)]
+struct UpdateJob {
+    running: bool,
+    finished: bool,
+    success: Option<bool>,
+    log: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -82,6 +92,7 @@ fn main() {
     let bind = args.bind.clone();
     let state = Arc::new(AppState {
         token: Mutex::new(load_initial_token(&args)),
+        update_job: Arc::new(Mutex::new(UpdateJob::default())),
         args,
     });
     let listener = TcpListener::bind(&bind).unwrap_or_else(|err| {
@@ -129,6 +140,7 @@ fn route_request(request: &Request, state: &AppState) -> Response {
         ("GET", "/api/auth/status") => auth_status(state),
         ("GET", "/api/update/status") => update_status(state),
         ("POST", "/api/update/run") => run_update(state),
+        ("GET", "/api/update/log") => update_log(state),
         ("POST", "/api/admin-token/generate") => generate_admin_token(state),
         ("GET", "/api/clients") => admin_json(&state.args, &["client", "list"]),
         ("POST", "/api/clients") => {
@@ -355,68 +367,150 @@ fn run_update(state: &AppState) -> Response {
         );
     }
 
-    let pull = {
-        let mut command = Command::new("git");
-        command
-            .arg("-c")
-            .arg(format!("safe.directory={}", repo.display()))
-            .arg("-C")
-            .arg(repo)
-            .args(["pull", "--ff-only"]);
-        run_capture(command)
-    };
-    let pull_output = match pull {
-        Ok(output) => output,
-        Err(err) => return Response::json(500, serde_json::json!({ "error": format!("git pull failed: {}", err) })),
-    };
+    {
+        let mut job = state.update_job.lock().expect("update job lock");
+        if job.running {
+            return Response::json(409, serde_json::json!({ "error": "update already running" }));
+        }
+        *job = UpdateJob {
+            running: true,
+            finished: false,
+            success: None,
+            log: vec!["Starting update...".to_string()],
+        };
+    }
 
-    let compose_output = run_compose_update(repo);
-    match compose_output {
-        Ok(output) => Response::json(
-            200,
-            serde_json::json!({
-                "message": "Update started. Services are being rebuilt and restarted.",
-                "restart_required": true,
-                "pull": pull_output,
-                "compose": output
-            }),
-        ),
-        Err(err) => Response::json(500, serde_json::json!({ "error": format!("docker compose update failed: {}", err), "pull": pull_output })),
+    let repo = repo.clone();
+    let job = state.update_job.clone();
+    thread::spawn(move || {
+        let result = run_update_job(repo, job.clone());
+        let mut guard = job.lock().expect("update job lock");
+        guard.running = false;
+        guard.finished = true;
+        guard.success = Some(result.is_ok());
+        match result {
+            Ok(()) => guard.log.push("Update command finished. Services may still be restarting.".to_string()),
+            Err(err) => guard.log.push(format!("Update failed: {err}")),
+        }
+    });
+
+    Response::json(
+        202,
+        serde_json::json!({ "message": "Update started", "running": true }),
+    )
+}
+
+fn update_log(state: &AppState) -> Response {
+    let job = state.update_job.lock().expect("update job lock");
+    Response::json(
+        200,
+        serde_json::json!({
+            "running": job.running,
+            "finished": job.finished,
+            "success": job.success,
+            "log": job.log.join("\n")
+        }),
+    )
+}
+
+fn append_update_log(job: &Arc<Mutex<UpdateJob>>, line: impl Into<String>) {
+    job.lock().expect("update job lock").log.push(line.into());
+}
+
+fn run_logged_command(mut command: Command, label: &str, job: Arc<Mutex<UpdateJob>>) -> Result<(), String> {
+    append_update_log(&job, "");
+    append_update_log(&job, format!("==> {label}"));
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    append_update_log(&job, format!("$ {:?}", command));
+
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_job = job.clone();
+    let stdout_reader = stdout.map(|stream| {
+        thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                append_update_log(&stdout_job, line);
+            }
+        })
+    });
+
+    let stderr_job = job.clone();
+    let stderr_reader = stderr.map(|stream| {
+        thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                append_update_log(&stderr_job, line);
+            }
+        })
+    });
+
+    let status = child.wait().map_err(|err| err.to_string())?;
+    if let Some(reader) = stdout_reader {
+        let _ = reader.join();
+    }
+    if let Some(reader) = stderr_reader {
+        let _ = reader.join();
+    }
+
+    if status.success() {
+        append_update_log(&job, format!("Command finished successfully: {label}"));
+        Ok(())
+    } else {
+        Err(format!("{label} exited with {status}"))
     }
 }
 
-fn run_compose_update(repo: &Path) -> Result<String, String> {
-    let services = ["aivpn-server", "aivpn-admin-web", "prometheus", "grafana"];
-    let compose_file = repo.join("docker-compose.yml");
+fn run_update_job(repo: PathBuf, job: Arc<Mutex<UpdateJob>>) -> Result<(), String> {
+    append_update_log(
+        &job,
+        "Note: this job does not restart aivpn-admin-web itself, because restarting this container would cut off the live log stream. Rebuild/restart aivpn-admin-web separately after reviewing the log.",
+    );
 
-    let mut command = Command::new("docker");
-    command
+    let mut pull = Command::new("git");
+    pull.arg("-c")
+        .arg(format!("safe.directory={}", repo.display()))
+        .arg("-C")
+        .arg(&repo)
+        .args(["pull", "--ff-only"]);
+    run_logged_command(pull, "git pull --ff-only", job.clone())?;
+
+    let compose_file = repo.join("docker-compose.yml");
+    let services = ["aivpn-server", "prometheus", "grafana"];
+    let mut compose = Command::new("docker");
+    compose
         .arg("compose")
         .arg("-f")
         .arg(&compose_file)
         .arg("--project-directory")
-        .arg(repo)
+        .arg(&repo)
         .arg("up")
         .arg("-d")
         .arg("--build")
         .args(services);
 
-    match run_capture(command) {
-        Ok(output) => Ok(output),
+    match run_logged_command(compose, "docker compose up -d --build", job.clone()) {
+        Ok(()) => {
+            append_update_log(
+                &job,
+                "Admin UI restart is still pending. Run: docker compose up -d --build aivpn-admin-web",
+            );
+            Ok(())
+        }
         Err(err) => {
+            append_update_log(&job, format!("docker compose failed: {err}"));
+            append_update_log(&job, "Trying docker-compose fallback...");
             let mut fallback = Command::new("docker-compose");
             fallback
                 .arg("-f")
                 .arg(&compose_file)
                 .arg("--project-directory")
-                .arg(repo)
+                .arg(&repo)
                 .arg("up")
                 .arg("-d")
                 .arg("--build")
                 .args(services);
-            run_capture(fallback).map_err(|fallback_err| {
-                format!("docker compose: {}; docker-compose: {}", err, fallback_err)
-            })
+            run_logged_command(fallback, "docker-compose up -d --build", job)
         }
     }
 }
@@ -665,15 +759,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
     code, textarea, pre { width: 100%; box-sizing: border-box; word-break: break-all; }
     pre { min-height: 96px; overflow: auto; white-space: pre-wrap; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; }
-    .qr { display: flex; justify-content: center; padding: 12px; background: #fff; border-radius: 8px; margin-bottom: 12px; min-height: 64px; }
+    .qr { display: flex; justify-content: center; align-items: center; padding: 12px; background: #fff; border-radius: 8px; margin-bottom: 12px; min-height: 64px; }
     .qr:empty { display: none; }
     .qr svg { max-width: 256px; width: 100%; height: auto; }
     .key-wrap { position: relative; display: inline-flex; flex-direction: column; align-items: center; max-width: 100%; }
     .key-popover { display: none; position: absolute; z-index: 10; top: calc(100% + 8px); left: 50%; transform: translateX(-50%); width: min(680px, calc(100vw - 48px)); background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: 8px; padding: 12px; box-shadow: 0 16px 48px rgba(0, 0, 0, .35); }
-    .key-wrap.has-key:hover .key-popover, .key-wrap.has-key:focus-within .key-popover { display: block; }
+    .key-wrap.has-key.popover-open .key-popover { display: block; }
     .key-text { margin: 8px 0 0; user-select: text; }
     details { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--panel-2); }
     summary { cursor: pointer; font-weight: 600; }
+    dialog { background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: 8px; padding: 16px; width: min(760px, calc(100vw - 48px)); height: min(640px, 72vh); min-width: 420px; min-height: 320px; resize: both; overflow: auto; }
+    dialog::backdrop { background: rgba(0, 0, 0, .45); }
+    .update-dialog-body { display: flex; flex-direction: column; height: 100%; gap: 12px; }
+    #updateStatus { flex: 1; min-height: 0; overflow: auto; resize: none; }
     .muted { color: var(--muted); }
     .error { color: var(--error); }
   </style>
@@ -715,9 +813,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
   <section id="connectionSection" hidden>
     <h2>Connection key</h2>
-    <div id="connectionKeyWrap" class="key-wrap">
-      <div id="connectionQr" class="qr" tabindex="0"></div>
-      <div id="connectionKeyPopover" class="key-popover" role="tooltip">
+    <div id="connectionKeyWrap" class="key-wrap" onmouseenter="showKeyPopover()" onmouseleave="scheduleHideKeyPopover()">
+      <div id="connectionQr" class="qr" tabindex="0" onfocus="showKeyPopover()" onblur="scheduleHideKeyPopover()"></div>
+      <div id="connectionKeyPopover" class="key-popover" role="tooltip" onmouseenter="showKeyPopover()" onmouseleave="scheduleHideKeyPopover()">
         <div class="row">
           <button onclick="copyConnectionKey()">Copy</button>
           <span id="copyStatus" class="muted"></span>
@@ -732,11 +830,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </section>
 
   <dialog id="updateDialog">
-    <h2>Update AIVPN</h2>
-    <pre id="updateStatus">Loading...</pre>
-    <div class="row">
-      <button id="runUpdateButton" onclick="runUpdate()" disabled>Update now</button>
-      <button onclick="document.getElementById('updateDialog').close()">Cancel</button>
+    <div class="update-dialog-body">
+      <h2>Update AIVPN</h2>
+      <pre id="updateStatus">Loading...</pre>
+      <div class="row">
+        <button id="runUpdateButton" onclick="runUpdate()" disabled>Update now</button>
+        <button id="closeUpdateButton" onclick="document.getElementById('updateDialog').close()">Cancel</button>
+      </div>
     </div>
   </dialog>
 </main>
@@ -746,6 +846,8 @@ tokenInput.value = localStorage.getItem('aivpnAdminToken') || '';
 document.documentElement.dataset.theme = localStorage.getItem('aivpnTheme') || 'dark';
 document.getElementById('grafanaLink').href = `${location.protocol}//${location.hostname}:3000/`;
 let currentConnectionKey = '';
+let updatePollTimer = null;
+let keyPopoverTimer = null;
 
 function useToken() {
   localStorage.setItem('aivpnAdminToken', tokenInput.value);
@@ -780,7 +882,9 @@ async function openUpdateDialog() {
   const dialog = document.getElementById('updateDialog');
   const status = document.getElementById('updateStatus');
   const button = document.getElementById('runUpdateButton');
+  const closeButton = document.getElementById('closeUpdateButton');
   button.disabled = true;
+  closeButton.disabled = false;
   status.textContent = 'Checking origin...';
   dialog.showModal();
   try {
@@ -804,24 +908,43 @@ async function openUpdateDialog() {
 }
 
 async function runUpdate() {
-  if (!confirm('Update from origin and restart AIVPN services?')) return;
+  if (!confirm('Update from origin and restart AIVPN services? Admin UI restart is handled separately so this log can stay visible.')) return;
   const status = document.getElementById('updateStatus');
   const button = document.getElementById('runUpdateButton');
+  const closeButton = document.getElementById('closeUpdateButton');
   button.disabled = true;
-  status.textContent = 'Updating. The Admin UI may restart and this page may disconnect...';
+  closeButton.disabled = true;
+  status.textContent = 'Starting update...\n';
   try {
-    const data = await api('/api/update/run', {method: 'POST'});
-    status.textContent = [
-      data.message || 'Update completed.',
-      '',
-      'git pull:',
-      data.pull || '-',
-      '',
-      'docker compose:',
-      data.compose || '-'
-    ].join('\n');
+    await api('/api/update/run', {method: 'POST'});
+    pollUpdateLog();
   } catch (err) {
     status.textContent = `Update failed: ${err.message || err}`;
+    closeButton.disabled = false;
+  }
+}
+
+async function pollUpdateLog() {
+  if (updatePollTimer) clearTimeout(updatePollTimer);
+  const status = document.getElementById('updateStatus');
+  const button = document.getElementById('runUpdateButton');
+  const closeButton = document.getElementById('closeUpdateButton');
+  try {
+    const data = await api('/api/update/log');
+    status.textContent = data.log || '';
+    status.scrollTop = status.scrollHeight;
+    if (data.running) {
+      updatePollTimer = setTimeout(pollUpdateLog, 1000);
+    } else {
+      button.disabled = data.success !== false;
+      closeButton.disabled = false;
+      if (data.success === false) {
+        status.textContent += '\n\nUpdate failed. You can retry after checking the log.';
+      }
+    }
+  } catch (err) {
+    status.textContent += `\n\nLog polling failed: ${err.message || err}`;
+    closeButton.disabled = false;
   }
 }
 
@@ -923,11 +1046,30 @@ function setConnectionKey(value, qrSvg = '') {
   currentConnectionKey = value || '';
   document.getElementById('connectionSection').hidden = !currentConnectionKey;
   document.getElementById('decodedDetails').open = false;
-  document.getElementById('connectionKeyWrap').classList.toggle('has-key', Boolean(currentConnectionKey));
+  const wrap = document.getElementById('connectionKeyWrap');
+  wrap.classList.toggle('has-key', Boolean(currentConnectionKey));
+  wrap.classList.remove('popover-open');
   document.getElementById('connectionQr').innerHTML = qrSvg;
   document.getElementById('connectionKeyText').textContent = currentConnectionKey;
   document.getElementById('copyStatus').textContent = '';
   document.getElementById('decodedKey').textContent = decodeConnectionKey(value);
+}
+
+function showKeyPopover() {
+  if (!currentConnectionKey) return;
+  if (keyPopoverTimer) {
+    clearTimeout(keyPopoverTimer);
+    keyPopoverTimer = null;
+  }
+  document.getElementById('connectionKeyWrap').classList.add('popover-open');
+}
+
+function scheduleHideKeyPopover() {
+  if (keyPopoverTimer) clearTimeout(keyPopoverTimer);
+  keyPopoverTimer = setTimeout(() => {
+    document.getElementById('connectionKeyWrap').classList.remove('popover-open');
+    keyPopoverTimer = null;
+  }, 2500);
 }
 
 async function copyConnectionKey() {
