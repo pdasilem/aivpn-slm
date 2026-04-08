@@ -319,6 +319,15 @@ fn update_status(state: &AppState) -> Response {
         Ok(value) => value,
         Err(err) => return Response::json(500, serde_json::json!({ "error": err })),
     };
+    let commits = if local == remote {
+        Vec::new()
+    } else {
+        git_capture(repo, &["log", "--oneline", "--no-decorate", &format!("{}..{}", local, upstream)])
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
 
     Response::json(
         200,
@@ -331,6 +340,7 @@ fn update_status(state: &AppState) -> Response {
             "remote": remote,
             "localShort": local.chars().take(12).collect::<String>(),
             "remoteShort": remote.chars().take(12).collect::<String>(),
+            "commits": commits,
             "upToDate": local == remote
         }),
     )
@@ -658,6 +668,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .qr { display: flex; justify-content: center; padding: 12px; background: #fff; border-radius: 8px; margin-bottom: 12px; min-height: 64px; }
     .qr:empty { display: none; }
     .qr svg { max-width: 256px; width: 100%; height: auto; }
+    .key-wrap { position: relative; display: inline-flex; flex-direction: column; align-items: center; max-width: 100%; }
+    .key-popover { display: none; position: absolute; z-index: 10; top: calc(100% + 8px); left: 50%; transform: translateX(-50%); width: min(680px, calc(100vw - 48px)); background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: 8px; padding: 12px; box-shadow: 0 16px 48px rgba(0, 0, 0, .35); }
+    .key-wrap.has-key:hover .key-popover, .key-wrap.has-key:focus-within .key-popover { display: block; }
+    .key-text { margin: 8px 0 0; user-select: text; }
+    details { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--panel-2); }
+    summary { cursor: pointer; font-weight: 600; }
     .muted { color: var(--muted); }
     .error { color: var(--error); }
   </style>
@@ -697,12 +713,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </table>
   </section>
 
-  <section>
+  <section id="connectionSection" hidden>
     <h2>Connection key</h2>
-    <div id="connectionQr" class="qr"></div>
-    <textarea id="connectionKey" rows="5" readonly></textarea>
-    <h2>Decoded key</h2>
-    <pre id="decodedKey"></pre>
+    <div id="connectionKeyWrap" class="key-wrap">
+      <div id="connectionQr" class="qr" tabindex="0"></div>
+      <div id="connectionKeyPopover" class="key-popover" role="tooltip">
+        <div class="row">
+          <button onclick="copyConnectionKey()">Copy</button>
+          <span id="copyStatus" class="muted"></span>
+        </div>
+        <pre id="connectionKeyText" class="key-text"></pre>
+      </div>
+    </div>
+    <details id="decodedDetails">
+      <summary>Decoded key</summary>
+      <pre id="decodedKey"></pre>
+    </details>
   </section>
 
   <dialog id="updateDialog">
@@ -719,6 +745,7 @@ const tokenInput = document.getElementById('token');
 tokenInput.value = localStorage.getItem('aivpnAdminToken') || '';
 document.documentElement.dataset.theme = localStorage.getItem('aivpnTheme') || 'dark';
 document.getElementById('grafanaLink').href = `${location.protocol}//${location.hostname}:3000/`;
+let currentConnectionKey = '';
 
 function useToken() {
   localStorage.setItem('aivpnAdminToken', tokenInput.value);
@@ -758,14 +785,17 @@ async function openUpdateDialog() {
   dialog.showModal();
   try {
     const data = await api('/api/update/status');
+    const commits = data.commits && data.commits.length
+      ? ['Missing commits:', ...data.commits.map(line => `  ${line}`)]
+      : ['Missing commits: -'];
     status.textContent = [
       `Repository: ${data.repo}`,
-      `Branch: ${data.branch}`,
-      `Upstream: ${data.upstream}`,
       `Remote: ${data.remoteUrl || '-'}`,
       `Current: ${data.localShort}`,
       `Origin: ${data.remoteShort}`,
-      data.upToDate ? 'Status: up to date' : 'Status: update available'
+      data.upToDate ? 'Status: up to date' : 'Status: update available',
+      '',
+      ...commits
     ].join('\n');
     button.disabled = data.upToDate;
   } catch (err) {
@@ -890,9 +920,36 @@ async function removeClient(id) {
 }
 
 function setConnectionKey(value, qrSvg = '') {
-  document.getElementById('connectionKey').value = value;
+  currentConnectionKey = value || '';
+  document.getElementById('connectionSection').hidden = !currentConnectionKey;
+  document.getElementById('decodedDetails').open = false;
+  document.getElementById('connectionKeyWrap').classList.toggle('has-key', Boolean(currentConnectionKey));
   document.getElementById('connectionQr').innerHTML = qrSvg;
+  document.getElementById('connectionKeyText').textContent = currentConnectionKey;
+  document.getElementById('copyStatus').textContent = '';
   document.getElementById('decodedKey').textContent = decodeConnectionKey(value);
+}
+
+async function copyConnectionKey() {
+  if (!currentConnectionKey) return;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(currentConnectionKey);
+    } else {
+      const area = document.createElement('textarea');
+      area.value = currentConnectionKey;
+      area.style.position = 'fixed';
+      area.style.left = '-9999px';
+      document.body.appendChild(area);
+      area.focus();
+      area.select();
+      document.execCommand('copy');
+      area.remove();
+    }
+    document.getElementById('copyStatus').textContent = 'Copied.';
+  } catch (err) {
+    document.getElementById('copyStatus').textContent = `Copy failed: ${err.message || err}`;
+  }
 }
 
 function decodeConnectionKey(value) {
