@@ -116,6 +116,8 @@ cd /opt/aivpn
 
 It can install through Docker Compose, enable IP forwarding, add the required iptables NAT MASQUERADE rule, update from git while preserving `config/`, uninstall with an option to keep settings, write `AIVPN_SERVER_IP` into `.env`, generate the admin UI token, start Prometheus/Grafana, and run firewall/Tailscale diagnostics.
 
+> **Admin UI security:** do not expose the admin UI directly to the public internet. It can add, remove, disable clients and trigger updates/restarts, so access must be restricted with Tailscale, an SSH tunnel, firewall rules, or another controlled private access layer. Use an admin token as an additional guard, not as the only boundary.
+
 ### 1. Clone the repo
 
 ```bash
