@@ -1,5 +1,5 @@
 # AIVPN Client Test Dockerfile
-FROM rust:1.86-slim AS builder
+FROM rust:slim AS builder
 
 WORKDIR /app
 
@@ -20,7 +20,7 @@ COPY aivpn-android-core aivpn-android-core/
 RUN cargo build --release --bin aivpn-client
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM debian:stable-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \

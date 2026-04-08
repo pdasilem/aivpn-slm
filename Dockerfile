@@ -2,7 +2,7 @@
 # Multi-stage build for minimal image size
 
 # Stage 1: Build
-FROM rust:1.86-slim AS builder
+FROM rust:slim AS builder
 
 WORKDIR /app
 
@@ -27,7 +27,7 @@ RUN sed -e '/"aivpn-client"/d' -e '/"aivpn-android-core"/d' Cargo.toml > Cargo.t
 RUN cargo build --release --features metrics --bin aivpn-server --bin aivpn-admin --bin aivpn-admin-web
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM debian:stable-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
