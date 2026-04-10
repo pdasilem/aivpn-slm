@@ -4,7 +4,7 @@
 //! Handles TUN device creation, packet capture, and routing.
 
 use std::io;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tracing::{info, debug, error};
 
 use aivpn_common::error::{Error, Result};
@@ -44,6 +44,7 @@ pub struct Tunnel {
     server_ip: Option<String>,
     /// Active IPv6 interface name saved before we add the blackhole route.
     /// Used to restore the route on disconnect instead of guessing (e.g. hard-coding en0).
+    #[cfg(target_os = "macos")]
     saved_ipv6_iface: Option<String>,
 }
 
@@ -55,6 +56,7 @@ impl Tunnel {
             writer: None,
             saved_default_gw: None,
             server_ip: None,
+            #[cfg(target_os = "macos")]
             saved_ipv6_iface: None,
         }
     }
@@ -82,7 +84,7 @@ impl Tunnel {
 
         #[cfg(target_os = "linux")]
         {
-            config_builder.name(&self.config.tun_name);
+            config_builder.tun_name(&self.config.tun_name);
             config_builder.platform_config(|config| {
                 config.ensure_root_privileges(true);
             });
@@ -258,8 +260,6 @@ impl Tunnel {
         use std::process::Command;
         
         let tun_name = &self.config.tun_name;
-        let peer_addr = "10.0.0.1";
-        
         // Add route for the VPN subnet through our TUN device
         let _ = Command::new("ip")
             .args(["route", "del", "10.0.0.0/24"])
@@ -558,17 +558,6 @@ impl Tunnel {
     }
 
     /// Restore IPv6 on Linux
-    #[cfg(target_os = "linux")]
-    fn restore_ipv6(&self) {
-        use std::process::Command;
-
-        info!("Restoring IPv6...");
-        // Remove the blackhole (if any).  Let the kernel re-discover the gateway.
-        let _ = Command::new("ip").args(["-6", "route", "del", "blackhole", "default"]).status();
-        let _ = Command::new("ip").args(["-6", "route", "del", "::/0"]).status();
-        info!("IPv6 blackhole removed — kernel will auto-restore via ND/RA");
-    }
-    
     /// Take the TUN reader (moves ownership to caller, e.g. spawned task)
     pub fn take_reader(&mut self) -> Option<tun::DeviceReader> {
         self.reader.take()

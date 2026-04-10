@@ -240,6 +240,174 @@ pub enum TransitionCondition {
 }
 
 impl MaskProfile {
+    /// Build a deterministic 64-dim fingerprint from the profile itself.
+    ///
+    /// This is not a trained model output. It is a stable structural signature
+    /// derived from the profile fields so the server-side neural module has a
+    /// meaningful baseline instead of all-zero vectors.
+    pub fn derived_signature_vector(&self) -> Vec<f32> {
+        let mut signature = vec![0.0f32; 64];
+
+        // Block 1 (0..16): expected packet-size shape
+        match self.size_distribution.dist_type {
+            SizeDistType::Histogram => {
+                let total: f32 = self
+                    .size_distribution
+                    .bins
+                    .iter()
+                    .map(|(_, _, p)| *p)
+                    .sum::<f32>()
+                    .max(1e-6);
+                for (min, max, probability) in &self.size_distribution.bins {
+                    let center = ((*min as u32 + *max as u32) / 2) as usize;
+                    let bin = (center / 80).min(15);
+                    signature[bin] += *probability / total;
+                }
+            }
+            SizeDistType::Parametric => {
+                let params = self
+                    .size_distribution
+                    .parametric_params
+                    .as_deref()
+                    .unwrap_or(&[]);
+                let center = match self.size_distribution.parametric_type {
+                    Some(ParametricType::LogNormal) => {
+                        let mu = params.first().copied().unwrap_or(5.0);
+                        let sigma = params.get(1).copied().unwrap_or(0.5);
+                        (mu.exp() * (1.0 + sigma * 0.1)).clamp(64.0, 1400.0)
+                    }
+                    Some(ParametricType::Gamma) => {
+                        let k = params.first().copied().unwrap_or(2.0);
+                        let theta = params.get(1).copied().unwrap_or(128.0);
+                        (k * theta).clamp(64.0, 1400.0)
+                    }
+                    Some(ParametricType::Bimodal) => {
+                        let a = params.first().copied().unwrap_or(5.0).exp();
+                        let b = params.get(1).copied().unwrap_or(6.0).exp();
+                        ((a + b) * 0.5).clamp(64.0, 1400.0)
+                    }
+                    None => 256.0,
+                };
+                let main_bin = ((center as usize) / 80).min(15);
+                signature[main_bin] = 0.7;
+                if main_bin > 0 {
+                    signature[main_bin - 1] += 0.15;
+                }
+                if main_bin < 15 {
+                    signature[main_bin + 1] += 0.15;
+                }
+            }
+        }
+
+        // Block 2 (16..24): expected IAT features
+        let jitter_mid = (self.iat_distribution.jitter_range_ms.0 + self.iat_distribution.jitter_range_ms.1) * 0.5;
+        let (iat_mean_ms, iat_std_ms) = match self.iat_distribution.dist_type {
+            IATDistType::Exponential => {
+                let lambda = self.iat_distribution.params.first().copied().unwrap_or(0.1).max(1e-6);
+                (1000.0 / lambda, 1000.0 / lambda)
+            }
+            IATDistType::LogNormal => {
+                let mu = self.iat_distribution.params.first().copied().unwrap_or(2.5);
+                let sigma = self.iat_distribution.params.get(1).copied().unwrap_or(0.3);
+                let mean = (mu + (sigma * sigma * 0.5)).exp();
+                let variance = ((sigma * sigma).exp() - 1.0) * (2.0 * mu + sigma * sigma).exp();
+                (mean, variance.sqrt())
+            }
+            IATDistType::Gamma => {
+                let k = self.iat_distribution.params.first().copied().unwrap_or(2.0);
+                let theta = self.iat_distribution.params.get(1).copied().unwrap_or(10.0);
+                (k * theta, k.sqrt() * theta)
+            }
+            IATDistType::Empirical => {
+                if self.iat_distribution.params.is_empty() {
+                    (50.0, 0.0)
+                } else {
+                    let n = self.iat_distribution.params.len() as f64;
+                    let mean = self.iat_distribution.params.iter().sum::<f64>() / n;
+                    let variance = self
+                        .iat_distribution
+                        .params
+                        .iter()
+                        .map(|x| (x - mean).powi(2))
+                        .sum::<f64>()
+                        / n;
+                    (mean, variance.sqrt())
+                }
+            }
+        };
+        signature[16] = ((iat_mean_ms + jitter_mid) / 100.0).min(1.0) as f32;
+        signature[17] = (iat_std_ms / 100.0).min(1.0) as f32;
+        signature[18] = ((iat_mean_ms + self.iat_distribution.jitter_range_ms.1) / 1000.0).min(1.0) as f32;
+        signature[19] = ((iat_mean_ms.max(0.0) + self.iat_distribution.jitter_range_ms.0) / 1000.0).min(1.0) as f32;
+        signature[20] = (iat_mean_ms * 0.75 / 100.0).min(1.0) as f32;
+        signature[21] = (iat_mean_ms / 100.0).min(1.0) as f32;
+        signature[22] = (iat_mean_ms * 1.25 / 100.0).min(1.0) as f32;
+        signature[23] = if iat_mean_ms > 0.0 {
+            (iat_std_ms / iat_mean_ms).min(1.0) as f32
+        } else {
+            0.0
+        };
+
+        // Block 3 (32..36): protocol/entropy bias
+        let protocol_entropy: f64 = match self.spoof_protocol {
+            SpoofProtocol::None => 6.0,
+            SpoofProtocol::QUIC => 7.6,
+            SpoofProtocol::WebRtcStun => 6.8,
+            SpoofProtocol::HttpsH2 => 7.2,
+            SpoofProtocol::DnsOverUdp => 5.0,
+        };
+        signature[32] = (protocol_entropy / 8.0) as f32;
+        signature[33] = ((self.header_template.len() as f32) / 64.0).min(1.0);
+        signature[34] = ((protocol_entropy + 0.4).min(8.0) / 8.0) as f32;
+        signature[35] = ((protocol_entropy - 0.4).max(0.0) / 8.0) as f32;
+
+        // Block 4 (48..52): temporal/volume expectations
+        let pps = if iat_mean_ms > 0.0 {
+            1000.0 / iat_mean_ms
+        } else {
+            0.0
+        };
+        let mean_size = {
+            let mut weighted_sum = 0.0f64;
+            let mut weighted_n = 0.0f64;
+            for (min, max, probability) in &self.size_distribution.bins {
+                weighted_sum += ((*min as f64 + *max as f64) * 0.5) * (*probability as f64);
+                weighted_n += *probability as f64;
+            }
+            if weighted_n > 0.0 {
+                weighted_sum / weighted_n
+            } else {
+                256.0
+            }
+        };
+        signature[48] = (pps / 1000.0).min(1.0) as f32;
+        signature[49] = ((pps * mean_size) / 1_000_000.0).min(1.0) as f32;
+        signature[50] = (mean_size / 1500.0).min(1.0) as f32;
+        signature[51] = (((self.fsm_states.len() as f32) * 0.1) + signature[17]).min(1.0);
+
+        // Structural tail: hash profile metadata into remaining dimensions.
+        let mut fingerprint_material = Vec::new();
+        fingerprint_material.extend_from_slice(self.mask_id.as_bytes());
+        fingerprint_material.extend_from_slice(&(self.version).to_le_bytes());
+        fingerprint_material.push(self.spoof_protocol as u8);
+        fingerprint_material.extend_from_slice(&(self.header_template.len() as u16).to_le_bytes());
+        fingerprint_material.extend_from_slice(&(self.fsm_states.len() as u16).to_le_bytes());
+        for window in 0..3usize {
+            let hash = blake3::keyed_hash(
+                &[window as u8; 32],
+                &fingerprint_material,
+            );
+            for (i, byte) in hash.as_bytes().iter().enumerate() {
+                let idx = 52 + window * 8 + (i % 8);
+                if idx < 64 {
+                    signature[idx] = (*byte as f32) / 255.0;
+                }
+            }
+        }
+
+        signature
+    }
+
     /// Verify Ed25519 signature over all profile fields except the signature itself
     pub fn verify_signature(&self, public_key: &[u8; 32]) -> Result<bool> {
         use ed25519_dalek::{Signature, VerifyingKey, Verifier};
@@ -302,7 +470,7 @@ pub mod preset_masks {
 
     /// WebRTC Zoom-like profile
     pub fn webrtc_zoom_v3() -> MaskProfile {
-        MaskProfile {
+        let mut mask = MaskProfile {
             mask_id: "webrtc_zoom_v3".to_string(),
             version: 1,
             created_at: 0,
@@ -342,15 +510,17 @@ pub mod preset_masks {
                 },
             ],
             fsm_initial_state: 0,
-            signature_vector: vec![0.0; 64],
+            signature_vector: Vec::new(),
             reverse_profile: None,
             signature: [0u8; 64],
-        }
+        };
+        mask.signature_vector = mask.derived_signature_vector();
+        mask
     }
 
     /// QUIC/HTTP3-like profile
     pub fn quic_https_v2() -> MaskProfile {
-        MaskProfile {
+        let mut mask = MaskProfile {
             mask_id: "quic_https_v2".to_string(),
             version: 1,
             created_at: 0,
@@ -382,9 +552,28 @@ pub mod preset_masks {
                 },
             ],
             fsm_initial_state: 0,
-            signature_vector: vec![0.0; 64],
+            signature_vector: Vec::new(),
             reverse_profile: None,
             signature: [0u8; 64],
-        }
+        };
+        mask.signature_vector = mask.derived_signature_vector();
+        mask
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preset_masks::{quic_https_v2, webrtc_zoom_v3};
+
+    #[test]
+    fn preset_masks_have_derived_nonzero_signatures() {
+        let webrtc = webrtc_zoom_v3();
+        let quic = quic_https_v2();
+
+        assert_eq!(webrtc.signature_vector.len(), 64);
+        assert_eq!(quic.signature_vector.len(), 64);
+        assert!(webrtc.signature_vector.iter().any(|v| *v != 0.0));
+        assert!(quic.signature_vector.iter().any(|v| *v != 0.0));
+        assert_ne!(webrtc.signature_vector, quic.signature_vector);
     }
 }

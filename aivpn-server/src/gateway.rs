@@ -256,12 +256,21 @@ impl Gateway {
             let sessions = self.session_manager.clone();
             let catalog = self.mask_catalog.clone();
             let metrics = self.metrics.clone();
+            let socket = self.udp_socket.as_ref().unwrap().clone();
             let check_interval = self.config.neural_config.check_interval_secs;
             
             tokio::spawn(async move {
-                Self::resonance_check_loop(neural, sessions, catalog, metrics, check_interval).await;
+                Self::resonance_check_loop(neural, sessions, catalog, metrics, socket, check_interval).await;
             });
             info!("Neural resonance check loop spawned (interval: {}s)", check_interval);
+
+            let sessions = self.session_manager.clone();
+            let metrics = self.metrics.clone();
+            let socket = self.udp_socket.as_ref().unwrap().clone();
+            tokio::spawn(async move {
+                Self::telemetry_request_loop(sessions, metrics, socket, Duration::from_secs(20)).await;
+            });
+            info!("Telemetry request loop spawned (interval: 20s)");
         }
         
         // Spawn TUN → Client read loop (reads packets from TUN, routes back to clients)
@@ -349,6 +358,7 @@ impl Gateway {
         sessions: Arc<SessionManager>,
         catalog: Arc<MaskCatalog>,
         metrics: Arc<MetricsCollector>,
+        socket: Arc<UdpSocket>,
         check_interval_secs: u64,
     ) {
         let interval = Duration::from_secs(check_interval_secs);
@@ -370,13 +380,22 @@ impl Gateway {
                 continue;
             }
             
-            let neural_guard = neural.lock();
+            let mut mask_updates = Vec::new();
+            {
+                let neural_guard = neural.lock();
             
-            for (session_id, mask_id) in &session_checks {
+                for (session_id, mask_id) in &session_checks {
                 // Check neural resonance (Patent 1: Signal Reconstruction Resonance)
                 match neural_guard.check_resonance(*session_id, mask_id) {
                     Ok(result) => {
                         metrics.record_neural_check(result.status == ResonanceStatus::Compromised);
+                        let status_code = match result.status {
+                            ResonanceStatus::Skip => 0,
+                            ResonanceStatus::Healthy => 1,
+                            ResonanceStatus::Warning => 2,
+                            ResonanceStatus::Compromised => 3,
+                        };
+                        metrics.record_neural_result(result.mse, status_code);
                         
                         match result.status {
                             ResonanceStatus::Compromised => {
@@ -396,10 +415,7 @@ impl Gateway {
                                         catalog.available_count()
                                     );
                                     
-                                    // Update session's mask
-                                    sessions.update_session_mask(session_id, new_mask.clone());
-                                    
-                                    metrics.record_mask_rotation();
+                                    mask_updates.push((*session_id, mask_id.clone(), new_mask));
                                 } else {
                                     error!("No replacement masks available. All masks compromised.");
                                 }
@@ -434,9 +450,56 @@ impl Gateway {
                             "Anomaly-triggered rotation to mask '{}'",
                             new_mask.mask_id
                         );
-                        sessions.update_session_mask(session_id, new_mask);
+                        mask_updates.push((*session_id, mask_id.clone(), new_mask));
+                    }
+                }
+            }
+            }
+
+            for (session_id, old_mask_id, new_mask) in mask_updates {
+                match Self::send_mask_update(
+                    &sessions,
+                    &socket,
+                    &metrics,
+                    &session_id,
+                    &new_mask,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        sessions.update_session_mask(&session_id, new_mask);
                         metrics.record_mask_rotation();
                     }
+                    Err(err) => {
+                        warn!(
+                            "MaskUpdate delivery failed for mask '{}' replacement: {}",
+                            old_mask_id, err
+                        );
+                        metrics.record_mask_update_failure();
+                    }
+                }
+            }
+        }
+    }
+
+    async fn telemetry_request_loop(
+        sessions: Arc<SessionManager>,
+        metrics: Arc<MetricsCollector>,
+        socket: Arc<UdpSocket>,
+        interval: Duration,
+    ) {
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let telemetry_request = ControlPayload::TelemetryRequest { metric_flags: 0xff };
+            let active_sessions: Vec<_> = sessions.iter_sessions().map(|entry| entry.value().clone()).collect();
+
+            for session in active_sessions {
+                if let Err(err) = Self::send_control_packet(&socket, &metrics, &telemetry_request, &session).await {
+                    debug!("Telemetry request delivery failed: {}", err);
+                    metrics.record_telemetry_request_failure();
+                } else {
+                    metrics.record_telemetry_request_sent();
                 }
             }
         }
@@ -883,11 +946,13 @@ impl Gateway {
         
         // Update session state. Avoid expensive O(window) tag-map rebuild on every packet.
         let mut client_db_flush: Option<(String, u64)> = None;
-        let (session_id, refresh_tags) = {
+        let (session_id, refresh_tags, iat_ms) = {
             let mut sess = session.lock();
+            let now = Instant::now();
+            let iat_ms = now.duration_since(sess.last_seen).as_secs_f64() * 1000.0;
             sess.counter = counter;
             sess.mark_tag_received(counter);
-            sess.last_seen = std::time::Instant::now();
+            sess.last_seen = now;
 
             // IP migration: update stored client address when a validated packet
             // arrives from a different endpoint (e.g. WiFi → cellular switchover).
@@ -916,7 +981,7 @@ impl Gateway {
             }
 
             sess.update_fsm();
-            (sess.session_id, refresh_tags)
+            (sess.session_id, refresh_tags, iat_ms)
         };
         
         // Refresh tag_map only when the precomputed window moves.
@@ -931,8 +996,6 @@ impl Gateway {
             let packet_size = packet_data.len() as u16;
             // Compute byte-level entropy of the encrypted payload
             let entropy = Self::compute_entropy(encrypted_payload);
-            // IAT is approximated by the last_seen timing
-            let iat_ms = 0.0; // Will be calculated from session timestamps in check loop
             // Neural model update is expensive under lock. Sampling every 16th packet
             // preserves trends while reducing lock contention in the receive hot path.
             if counter & 0x0f == 0 {
@@ -1024,6 +1087,7 @@ impl Gateway {
                     new_eph_pub,
                 )?;
                 self.send_control_message(&hello, session).await?;
+                self.metrics.record_key_rotation();
             }
             ControlPayload::MaskUpdate { .. } => {
                 warn!("Unexpected MASK_UPDATE from client");
@@ -1048,8 +1112,31 @@ impl Gateway {
                 };
                 self.send_control_message(&response, session).await?;
             }
-            ControlPayload::TelemetryResponse { .. } => {
-                debug!("Telemetry response received");
+            ControlPayload::TelemetryResponse { packet_loss, rtt_ms, jitter_ms, buffer_pct } => {
+                let mask_id = session
+                    .lock()
+                    .mask
+                    .as_ref()
+                    .map(|m| m.mask_id.clone())
+                    .unwrap_or_else(|| "webrtc_zoom_v3".to_string());
+                self.neural_module
+                    .lock()
+                    .record_telemetry(&mask_id, packet_loss as f64 / 10_000.0, rtt_ms as f64);
+                self.metrics.record_telemetry_response(
+                    packet_loss as f64 / 10_000.0,
+                    rtt_ms,
+                    jitter_ms,
+                    buffer_pct,
+                );
+                debug!(
+                    "Telemetry response from {}: mask={}, loss_bps={}, rtt_ms={}, jitter_ms={}, buffer_pct={}",
+                    hash_addr(&client_addr),
+                    mask_id,
+                    packet_loss,
+                    rtt_ms,
+                    jitter_ms,
+                    buffer_pct,
+                );
             }
             ControlPayload::TimeSync { .. } => {
                 debug!("Time sync request");
@@ -1080,23 +1167,64 @@ impl Gateway {
         session: &Arc<parking_lot::Mutex<Session>>,
     ) -> Result<()> {
         let socket = self.udp_socket.as_ref().unwrap();
-        
+        let sent = Self::send_control_packet(socket, &self.metrics, payload, session).await?;
+        debug!("Control message sent: {} bytes", sent);
+        Ok(())
+    }
+
+    async fn send_mask_update(
+        sessions: &Arc<SessionManager>,
+        socket: &Arc<UdpSocket>,
+        metrics: &Arc<MetricsCollector>,
+        session_id: &[u8; 16],
+        new_mask: &MaskProfile,
+    ) -> Result<()> {
+        let mask_data = rmp_serde::to_vec(new_mask)?;
+        let signature = sessions.sign_mask(&mask_data);
+        let payload = ControlPayload::MaskUpdate {
+            mask_data,
+            signature,
+        };
+        let session = sessions
+            .get_session(session_id)
+            .ok_or_else(|| Error::Session("Session not found for MaskUpdate".into()))?;
+        Self::send_control_packet(socket, metrics, &payload, &session).await?;
+        Ok(())
+    }
+
+    async fn send_control_packet(
+        socket: &Arc<UdpSocket>,
+        metrics: &Arc<MetricsCollector>,
+        payload: &ControlPayload,
+        session: &Arc<parking_lot::Mutex<Session>>,
+    ) -> Result<usize> {
         let encoded = payload.encode()?;
-        let packet = self.build_packet(&encoded, session)?;
-        
-        // Extract client_addr before dropping the guard to avoid holding
-        // MutexGuard across .await (which would cause deadlock)
+        let seq_num = session.lock().next_seq() as u16;
+        let inner_header = InnerHeader {
+            inner_type: InnerType::Control,
+            seq_num,
+        };
+        let mut inner_payload = inner_header.encode().to_vec();
+        inner_payload.extend_from_slice(&encoded);
+        let packet = Self::build_packet_for_session(&inner_payload, session)?;
+
         let client_addr = session.lock().client_addr;
         let sent = socket.send_to(&packet, client_addr).await?;
-        self.metrics.record_packet_sent(sent);
-        
-        Ok(())
+        metrics.record_packet_sent(sent);
+        Ok(sent)
     }
     
     /// Build AIVPN packet
     /// Wire format: TAG | MDH | encrypt(pad_len_u16 || plaintext || random_padding)
     fn build_packet(
         &self,
+        plaintext: &[u8],
+        session: &Arc<parking_lot::Mutex<Session>>,
+    ) -> Result<Vec<u8>> {
+        Self::build_packet_for_session(plaintext, session)
+    }
+
+    fn build_packet_for_session(
         plaintext: &[u8],
         session: &Arc<parking_lot::Mutex<Session>>,
     ) -> Result<Vec<u8>> {

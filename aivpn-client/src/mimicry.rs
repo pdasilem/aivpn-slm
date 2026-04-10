@@ -3,14 +3,13 @@
 //! Shapes traffic to match Mask profile characteristics
 
 use std::time::{Duration, Instant};
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{RngCore, SeedableRng};
 use rand::rngs::StdRng;
 use tracing::debug;
 
 use aivpn_common::crypto::{self, encrypt_payload, SessionKeys, TAG_SIZE, NONCE_SIZE, POLY1305_TAG_SIZE};
-use aivpn_common::protocol::{AivpnPacket, InnerType, InnerHeader, ControlPayload, MAX_PACKET_SIZE};
 use aivpn_common::mask::{MaskProfile, PaddingStrategy, SpoofProtocol};
-use aivpn_common::error::{Error, Result};
+use aivpn_common::error::Result;
 
 /// Mimicry Engine state
 pub struct MimicryState {

@@ -26,6 +26,7 @@ use aivpn_common::crypto::{
     self, derive_session_keys, KeyPair, SessionKeys,
 };
 use aivpn_common::error::{Error, Result};
+use aivpn_common::mask::MaskProfile;
 use aivpn_common::protocol::{ControlPayload, InnerType};
 use aivpn_common::upload_pipeline::{self, PacketEncryptor, UploadConfig};
 
@@ -47,6 +48,74 @@ pub struct SessionRuntime {
     udp_fd: AtomicI32,
     upload_bytes: AtomicU64,
     download_bytes: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct TelemetrySnapshot {
+    packet_loss_bps: u16,
+    rtt_ms: u16,
+    jitter_ms: u16,
+    buffer_pct: u8,
+}
+
+struct TelemetryState {
+    pending_keepalive_sent_at: Option<Instant>,
+    keepalive_sent: u32,
+    keepalive_acked: u32,
+    keepalive_lost: u32,
+    ewma_rtt_ms: f64,
+    ewma_jitter_ms: f64,
+}
+
+impl TelemetryState {
+    fn new() -> Self {
+        Self {
+            pending_keepalive_sent_at: None,
+            keepalive_sent: 0,
+            keepalive_acked: 0,
+            keepalive_lost: 0,
+            ewma_rtt_ms: 0.0,
+            ewma_jitter_ms: 0.0,
+        }
+    }
+
+    fn on_keepalive_sent(&mut self) {
+        let now = Instant::now();
+        if let Some(previous) = self.pending_keepalive_sent_at {
+            if now.duration_since(previous) > Duration::from_secs(30) {
+                self.keepalive_lost = self.keepalive_lost.saturating_add(1);
+            }
+        }
+        self.pending_keepalive_sent_at = Some(now);
+        self.keepalive_sent = self.keepalive_sent.saturating_add(1);
+    }
+
+    fn on_keepalive_ack(&mut self) {
+        let Some(sent_at) = self.pending_keepalive_sent_at.take() else {
+            return;
+        };
+        let sample_rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+        if self.ewma_rtt_ms == 0.0 {
+            self.ewma_rtt_ms = sample_rtt_ms;
+            self.ewma_jitter_ms = 0.0;
+        } else {
+            let delta = (sample_rtt_ms - self.ewma_rtt_ms).abs();
+            self.ewma_jitter_ms = self.ewma_jitter_ms * 0.75 + delta * 0.25;
+            self.ewma_rtt_ms = self.ewma_rtt_ms * 0.875 + sample_rtt_ms * 0.125;
+        }
+        self.keepalive_acked = self.keepalive_acked.saturating_add(1);
+    }
+
+    fn snapshot(&self) -> TelemetrySnapshot {
+        let sent = self.keepalive_sent.max(1) as f64;
+        let loss_ratio = (self.keepalive_lost as f64 / sent).clamp(0.0, 1.0);
+        TelemetrySnapshot {
+            packet_loss_bps: (loss_ratio * 10_000.0).round() as u16,
+            rtt_ms: self.ewma_rtt_ms.clamp(0.0, u16::MAX as f64).round() as u16,
+            jitter_ms: self.ewma_jitter_ms.clamp(0.0, u16::MAX as f64).round() as u16,
+            buffer_pct: 0,
+        }
+    }
 }
 
 impl SessionRuntime {
@@ -255,13 +324,16 @@ pub async fn run_tunnel_android(
         counter: send_counter,
         seq: send_seq,
     }));
+    let telemetry_state = Arc::new(Mutex::new(TelemetryState::new()));
     let upload_state_for_sender = upload_state.clone();
+    let telemetry_state_for_sender = telemetry_state.clone();
     let session_for_upload = session.clone();
     let upload_sender_task = tokio::spawn(async move {
         // Wrap zero-MDH encryption with UPLOAD_BYTES tracking.
         struct AndroidEncryptor {
             upload_state: Arc<Mutex<AndroidCryptoState>>,
             session: Arc<SessionRuntime>,
+            telemetry_state: Arc<Mutex<TelemetryState>>,
         }
 
         impl PacketEncryptor for AndroidEncryptor {
@@ -273,6 +345,10 @@ pub async fn run_tunnel_android(
                 build_zero_mdh_packet(&keys, &mut state.counter, &inner, None)
             }
             fn encrypt_keepalive(&mut self) -> aivpn_common::error::Result<Vec<u8>> {
+                self.telemetry_state
+                    .lock()
+                    .expect("android telemetry state poisoned")
+                    .on_keepalive_sent();
                 self.encrypt_control(&ControlPayload::Keepalive)
             }
             fn encrypt_control(&mut self, control: &ControlPayload) -> aivpn_common::error::Result<Vec<u8>> {
@@ -293,6 +369,7 @@ pub async fn run_tunnel_android(
         let mut enc = AndroidEncryptor {
             upload_state: upload_state_for_sender,
             session: session_for_upload,
+            telemetry_state: telemetry_state_for_sender,
         };
         let config = UploadConfig {
             keepalive_interval: KEEPALIVE_INTERVAL,
@@ -376,6 +453,23 @@ pub async fn run_tunnel_android(
                             .fetch_add(decoded.payload.len() as u64, Ordering::Relaxed);
                     } else if decoded.header.inner_type == InnerType::Control {
                         match ControlPayload::decode(&decoded.payload)? {
+                            ControlPayload::MaskUpdate { mask_data, signature } => {
+                                crypto::verify_mask_update_signature(
+                                    &server_signing_pub,
+                                    &mask_data,
+                                    &signature,
+                                )?;
+                                let new_mask: MaskProfile = rmp_serde::from_slice(&mask_data)
+                                    .map_err(|e| Error::Serialization(format!("Invalid MaskUpdate payload: {e}")))?;
+                                if new_mask.header_template.as_slice() == DEFAULT_ZERO_MDH {
+                                    log::info!("aivpn: zero-MDH MaskUpdate verified for {}", new_mask.mask_id);
+                                } else {
+                                    log::warn!(
+                                        "aivpn: verified MaskUpdate for {} but advanced masks are not applied on Android zero-MDH client yet",
+                                        new_mask.mask_id
+                                    );
+                                }
+                            }
                             ControlPayload::ServerHello { server_eph_pub, signature } => {
                                 let ratchet_keypair = pending_ratchet_keypair
                                     .take()
@@ -403,7 +497,35 @@ pub async fn run_tunnel_android(
                                 }
                                 log::info!("aivpn: key rotation applied");
                             }
-                            ControlPayload::Keepalive | ControlPayload::ControlAck { .. } => {}
+                            ControlPayload::Keepalive => {}
+                            ControlPayload::TelemetryRequest { .. } => {
+                                let snapshot = telemetry_state
+                                    .lock()
+                                    .expect("android telemetry state poisoned")
+                                    .snapshot();
+                                if control_tx
+                                    .send(ControlPayload::TelemetryResponse {
+                                        packet_loss: snapshot.packet_loss_bps,
+                                        rtt_ms: snapshot.rtt_ms,
+                                        jitter_ms: snapshot.jitter_ms,
+                                        buffer_pct: snapshot.buffer_pct,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    tun_reader_task.abort();
+                                    upload_sender_task.abort();
+                                    return Err(Error::Channel("control upload channel closed".into()));
+                                }
+                            }
+                            ControlPayload::ControlAck { ack_for_subtype, .. } => {
+                                if ack_for_subtype == aivpn_common::protocol::ControlSubtype::Keepalive as u8 {
+                                    telemetry_state
+                                        .lock()
+                                        .expect("android telemetry state poisoned")
+                                        .on_keepalive_ack();
+                                }
+                            }
                             other => {
                                 log::debug!("aivpn: control from server: {:?}", other);
                             }

@@ -279,6 +279,20 @@ pub fn verify_server_hello_signature(
         .map_err(|_| Error::Crypto("ServerHello signature verification failed".into()))
 }
 
+/// Verify detached Ed25519 signature over serialized MaskUpdate payload.
+pub fn verify_mask_update_signature(
+    signing_pub: &[u8; 32],
+    mask_data: &[u8],
+    signature: &[u8; 64],
+) -> Result<()> {
+    let verifying_key = VerifyingKey::from_bytes(signing_pub)
+        .map_err(|e| Error::Crypto(format!("Invalid server signing key: {}", e)))?;
+    let signature = Signature::from_bytes(signature);
+    verifying_key
+        .verify(mask_data, &signature)
+        .map_err(|_| Error::Crypto("MaskUpdate signature verification failed".into()))
+}
+
 /// Compute HMAC-SHA256
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     use hmac::Mac;
@@ -352,5 +366,20 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_mask_update_signature_verification() {
+        let server_private = [7u8; X25519_PRIVATE_KEY_SIZE];
+        let signing_key = derive_server_signing_key(&server_private);
+        let signing_pub = derive_server_signing_public_key(&server_private);
+        let mask_data = b"mask-update-payload";
+        let signature = signing_key.sign(mask_data).to_bytes();
+
+        verify_mask_update_signature(&signing_pub, mask_data, &signature).unwrap();
+
+        let mut tampered = mask_data.to_vec();
+        tampered[0] ^= 1;
+        assert!(verify_mask_update_signature(&signing_pub, &tampered, &signature).is_err());
     }
 }

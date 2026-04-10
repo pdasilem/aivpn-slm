@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -62,6 +62,74 @@ struct UploadCryptoState {
     seq: u16,
 }
 
+#[derive(Debug, Clone)]
+struct TelemetrySnapshot {
+    packet_loss_bps: u16,
+    rtt_ms: u16,
+    jitter_ms: u16,
+    buffer_pct: u8,
+}
+
+struct TelemetryState {
+    pending_keepalive_sent_at: Option<Instant>,
+    keepalive_sent: u32,
+    keepalive_acked: u32,
+    keepalive_lost: u32,
+    ewma_rtt_ms: f64,
+    ewma_jitter_ms: f64,
+}
+
+impl TelemetryState {
+    fn new() -> Self {
+        Self {
+            pending_keepalive_sent_at: None,
+            keepalive_sent: 0,
+            keepalive_acked: 0,
+            keepalive_lost: 0,
+            ewma_rtt_ms: 0.0,
+            ewma_jitter_ms: 0.0,
+        }
+    }
+
+    fn on_keepalive_sent(&mut self) {
+        let now = Instant::now();
+        if let Some(previous) = self.pending_keepalive_sent_at {
+            if now.duration_since(previous) > Duration::from_secs(30) {
+                self.keepalive_lost = self.keepalive_lost.saturating_add(1);
+            }
+        }
+        self.pending_keepalive_sent_at = Some(now);
+        self.keepalive_sent = self.keepalive_sent.saturating_add(1);
+    }
+
+    fn on_keepalive_ack(&mut self) {
+        let Some(sent_at) = self.pending_keepalive_sent_at.take() else {
+            return;
+        };
+        let sample_rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+        if self.ewma_rtt_ms == 0.0 {
+            self.ewma_rtt_ms = sample_rtt_ms;
+            self.ewma_jitter_ms = 0.0;
+        } else {
+            let delta = (sample_rtt_ms - self.ewma_rtt_ms).abs();
+            self.ewma_jitter_ms = self.ewma_jitter_ms * 0.75 + delta * 0.25;
+            self.ewma_rtt_ms = self.ewma_rtt_ms * 0.875 + sample_rtt_ms * 0.125;
+        }
+        self.keepalive_acked = self.keepalive_acked.saturating_add(1);
+    }
+
+    fn snapshot(&self) -> TelemetrySnapshot {
+        let sent = self.keepalive_sent.max(1) as f64;
+        let loss_ratio = (self.keepalive_lost as f64 / sent).clamp(0.0, 1.0);
+        TelemetrySnapshot {
+            packet_loss_bps: (loss_ratio * 10_000.0).round() as u16,
+            rtt_ms: self.ewma_rtt_ms.clamp(0.0, u16::MAX as f64).round() as u16,
+            jitter_ms: self.ewma_jitter_ms.clamp(0.0, u16::MAX as f64).round() as u16,
+            buffer_pct: 0,
+        }
+    }
+}
+
 /// AIVPN Client instance
 pub struct AivpnClient {
     config: ClientConfig,
@@ -73,18 +141,16 @@ pub struct AivpnClient {
     upload_state: Option<Arc<Mutex<UploadCryptoState>>>,
     transition_recv_keys: Option<SessionKeys>,
     pending_ratchet_keypair: Option<KeyPair>,
+    control_tx: Option<mpsc::Sender<ControlPayload>>,
+    telemetry_state: Arc<Mutex<TelemetryState>>,
     keypair: KeyPair,
     counter: u64,
     send_seq: u32,
-    recv_seq: u32,
     recv_window: RecvWindow,
     transition_recv_window: RecvWindow,
     // Traffic counters
     bytes_sent: Arc<std::sync::atomic::AtomicU64>,
     bytes_received: Arc<std::sync::atomic::AtomicU64>,
-    // Pre-allocated buffers for zero-copy I/O (OPTIMIZATION)
-    send_buf: Vec<u8>,
-    recv_buf: Vec<u8>,
 }
 
 impl AivpnClient {
@@ -105,17 +171,15 @@ impl AivpnClient {
             upload_state: None,
             transition_recv_keys: None,
             pending_ratchet_keypair: None,
+            control_tx: None,
+            telemetry_state: Arc::new(Mutex::new(TelemetryState::new())),
             keypair,
             counter: 0,
             send_seq: 0,
-            recv_seq: 0,
             recv_window: RecvWindow::new(),
             transition_recv_window: RecvWindow::new(),
             bytes_sent: bytes_sent.clone(),
             bytes_received: bytes_received.clone(),
-            // Pre-allocate buffers to MAX_PACKET_SIZE to avoid reallocations
-            send_buf: Vec::with_capacity(MAX_PACKET_SIZE),
-            recv_buf: Vec::with_capacity(MAX_PACKET_SIZE),
         })
     }
     
@@ -217,6 +281,7 @@ impl AivpnClient {
         let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(8192);
         let (udp_to_tun_tx, mut udp_to_tun_rx) = mpsc::channel::<Bytes>(8192);
         let (control_tx, control_rx) = mpsc::channel::<ControlPayload>(64);
+        self.control_tx = Some(control_tx.clone());
 
         // Take the TUN reader for the spawned task (no Mutex needed)
         let mut tun_reader = self.tunnel.take_reader()
@@ -322,6 +387,7 @@ impl AivpnClient {
         let upload_seq = self.send_seq as u16;
         let upload_counter = self.counter;
         let upload_bytes_sent = self.bytes_sent.clone();
+        let telemetry_state = self.telemetry_state.clone();
         let upload_state = Arc::new(Mutex::new(UploadCryptoState {
             keys: upload_keys,
             counter: upload_counter,
@@ -339,6 +405,7 @@ impl AivpnClient {
             upload_engine,
             upload_state,
             upload_bytes_sent,
+            telemetry_state,
         ));
 
         // Main loop: download + shutdown + upload health
@@ -412,6 +479,7 @@ impl AivpnClient {
         let _ = udp_task.await;
 
         self.disconnect().await;
+        self.control_tx = None;
 
         run_res
     }
@@ -424,12 +492,14 @@ impl AivpnClient {
         engine: MimicryEngine,
         upload_state: Arc<Mutex<UploadCryptoState>>,
         bytes_sent: Arc<std::sync::atomic::AtomicU64>,
+        telemetry_state: Arc<Mutex<TelemetryState>>,
     ) -> Result<()> {
         /// Wraps MimicryEngine to implement the shared PacketEncryptor trait.
         struct MimicryEncryptor {
             engine: MimicryEngine,
             upload_state: Arc<Mutex<UploadCryptoState>>,
             bytes_sent: Arc<std::sync::atomic::AtomicU64>,
+            telemetry_state: Arc<Mutex<TelemetryState>>,
         }
 
         impl PacketEncryptor for MimicryEncryptor {
@@ -444,6 +514,10 @@ impl AivpnClient {
             }
 
             fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
+                self.telemetry_state
+                    .lock()
+                    .expect("telemetry state poisoned")
+                    .on_keepalive_sent();
                 self.encrypt_control(&ControlPayload::Keepalive)
             }
 
@@ -461,7 +535,7 @@ impl AivpnClient {
             }
         }
 
-        let mut enc = MimicryEncryptor { engine, upload_state, bytes_sent };
+        let mut enc = MimicryEncryptor { engine, upload_state, bytes_sent, telemetry_state };
         let config = UploadConfig {
             keepalive_interval: Duration::from_secs(15),
             ..Default::default()
@@ -522,7 +596,12 @@ impl AivpnClient {
     /// Handle control messages from server
     async fn handle_server_control(&mut self, control: ControlPayload) -> Result<()> {
         match control {
-            ControlPayload::MaskUpdate { mask_data, .. } => {
+            ControlPayload::MaskUpdate { mask_data, signature } => {
+                crypto::verify_mask_update_signature(
+                    &self.config.server_signing_pub,
+                    &mask_data,
+                    &signature,
+                )?;
                 match rmp_serde::from_slice::<MaskProfile>(&mask_data) {
                     Ok(new_mask) => self.update_mask(new_mask),
                     Err(e) => warn!("Failed to parse mask update: {}", e),
@@ -576,14 +655,44 @@ impl AivpnClient {
             ControlPayload::Keepalive => {
                 debug!("Keepalive from server");
             }
+            ControlPayload::TelemetryRequest { .. } => {
+                if let Some(control_tx) = &self.control_tx {
+                    let snapshot = self
+                        .telemetry_state
+                        .lock()
+                        .expect("telemetry state poisoned")
+                        .snapshot();
+                    control_tx
+                        .send(ControlPayload::TelemetryResponse {
+                            packet_loss: snapshot.packet_loss_bps,
+                            rtt_ms: snapshot.rtt_ms,
+                            jitter_ms: snapshot.jitter_ms,
+                            buffer_pct: snapshot.buffer_pct,
+                        })
+                        .await
+                        .map_err(|_| Error::Channel("control upload channel closed".into()))?;
+                } else {
+                    return Err(Error::Channel("control upload channel unavailable".into()));
+                }
+            }
+            ControlPayload::TelemetryResponse { .. } => {
+                debug!("Ignoring unexpected telemetry response on client");
+            }
             ControlPayload::TimeSync { server_ts_ms } => {
                 debug!("Time sync: server_ts={}", server_ts_ms);
+            }
+            ControlPayload::ControlAck { ack_for_subtype, .. } => {
+                if ack_for_subtype == aivpn_common::protocol::ControlSubtype::Keepalive as u8 {
+                    self.telemetry_state
+                        .lock()
+                        .expect("telemetry state poisoned")
+                        .on_keepalive_ack();
+                }
             }
             ControlPayload::Shutdown { reason } => {
                 info!("Server requested shutdown (reason: {})", reason);
                 self.disconnect().await;
             }
-            _ => {}
         }
         Ok(())
     }

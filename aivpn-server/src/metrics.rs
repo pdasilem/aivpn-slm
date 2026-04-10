@@ -15,6 +15,8 @@ use prometheus::{Counter, Encoder, Gauge, Histogram, HistogramOpts, Opts, Regist
 #[cfg(feature = "metrics")]
 use std::sync::Arc;
 #[cfg(feature = "metrics")]
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(feature = "metrics")]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -80,9 +82,53 @@ pub struct MetricsCollector {
 
     #[cfg(feature = "metrics")]
     dpi_attacks_detected: Counter,
+
+    #[cfg(feature = "metrics")]
+    telemetry_requests_sent: Counter,
+
+    #[cfg(feature = "metrics")]
+    telemetry_request_failures: Counter,
+
+    #[cfg(feature = "metrics")]
+    telemetry_responses_received: Counter,
+
+    #[cfg(feature = "metrics")]
+    telemetry_last_packet_loss_ratio: Gauge,
+
+    #[cfg(feature = "metrics")]
+    telemetry_last_rtt_ms: Gauge,
+
+    #[cfg(feature = "metrics")]
+    telemetry_last_jitter_ms: Gauge,
+
+    #[cfg(feature = "metrics")]
+    telemetry_last_buffer_pct: Gauge,
+
+    #[cfg(feature = "metrics")]
+    telemetry_last_update_unix_seconds: Gauge,
+
+    #[cfg(feature = "metrics")]
+    neural_last_mse: Gauge,
+
+    #[cfg(feature = "metrics")]
+    neural_last_status: Gauge,
+
+    #[cfg(feature = "metrics")]
+    neural_last_update_unix_seconds: Gauge,
+
+    #[cfg(feature = "metrics")]
+    mask_update_failures: Counter,
 }
 
 impl MetricsCollector {
+    #[cfg(feature = "metrics")]
+    fn unix_timestamp_seconds() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or_default()
+    }
+
     /// Create new metrics collector
     pub fn new() -> Self {
         #[cfg(feature = "metrics")]
@@ -243,6 +289,114 @@ impl MetricsCollector {
                 .register(Box::new(dpi_attacks_detected.clone()))
                 .unwrap();
 
+            let telemetry_requests_sent = Counter::with_opts(Opts::new(
+                "aivpn_telemetry_requests_sent_total",
+                "Total telemetry requests sent to clients",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(telemetry_requests_sent.clone()))
+                .unwrap();
+
+            let telemetry_request_failures = Counter::with_opts(Opts::new(
+                "aivpn_telemetry_request_failures_total",
+                "Total telemetry request delivery failures",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(telemetry_request_failures.clone()))
+                .unwrap();
+
+            let telemetry_responses_received = Counter::with_opts(Opts::new(
+                "aivpn_telemetry_responses_received_total",
+                "Total telemetry responses received from clients",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(telemetry_responses_received.clone()))
+                .unwrap();
+
+            let telemetry_last_packet_loss_ratio = Gauge::with_opts(Opts::new(
+                "aivpn_telemetry_last_packet_loss_ratio",
+                "Latest client-reported packet loss ratio (0..1)",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(telemetry_last_packet_loss_ratio.clone()))
+                .unwrap();
+
+            let telemetry_last_rtt_ms = Gauge::with_opts(Opts::new(
+                "aivpn_telemetry_last_rtt_ms",
+                "Latest client-reported RTT in milliseconds",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(telemetry_last_rtt_ms.clone()))
+                .unwrap();
+
+            let telemetry_last_jitter_ms = Gauge::with_opts(Opts::new(
+                "aivpn_telemetry_last_jitter_ms",
+                "Latest client-reported jitter in milliseconds",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(telemetry_last_jitter_ms.clone()))
+                .unwrap();
+
+            let telemetry_last_buffer_pct = Gauge::with_opts(Opts::new(
+                "aivpn_telemetry_last_buffer_pct",
+                "Latest client-reported buffer fill percentage",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(telemetry_last_buffer_pct.clone()))
+                .unwrap();
+
+            let telemetry_last_update_unix_seconds = Gauge::with_opts(Opts::new(
+                "aivpn_telemetry_last_update_unix_seconds",
+                "Unix timestamp of the latest telemetry response",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(telemetry_last_update_unix_seconds.clone()))
+                .unwrap();
+
+            let neural_last_mse = Gauge::with_opts(Opts::new(
+                "aivpn_neural_last_mse",
+                "Latest neural resonance MSE",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(neural_last_mse.clone()))
+                .unwrap();
+
+            let neural_last_status = Gauge::with_opts(Opts::new(
+                "aivpn_neural_last_status",
+                "Latest neural resonance status (0=skip,1=healthy,2=warning,3=compromised)",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(neural_last_status.clone()))
+                .unwrap();
+
+            let neural_last_update_unix_seconds = Gauge::with_opts(Opts::new(
+                "aivpn_neural_last_update_unix_seconds",
+                "Unix timestamp of the latest neural resonance decision",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(neural_last_update_unix_seconds.clone()))
+                .unwrap();
+
+            let mask_update_failures = Counter::with_opts(Opts::new(
+                "aivpn_mask_update_failures_total",
+                "Total failed server-triggered MaskUpdate deliveries",
+            ))
+            .unwrap();
+            registry
+                .register(Box::new(mask_update_failures.clone()))
+                .unwrap();
+
             Self {
                 registry,
                 sessions_total,
@@ -263,6 +417,18 @@ impl MetricsCollector {
                 neural_checks_total,
                 neural_checks_failed,
                 dpi_attacks_detected,
+                telemetry_requests_sent,
+                telemetry_request_failures,
+                telemetry_responses_received,
+                telemetry_last_packet_loss_ratio,
+                telemetry_last_rtt_ms,
+                telemetry_last_jitter_ms,
+                telemetry_last_buffer_pct,
+                telemetry_last_update_unix_seconds,
+                neural_last_mse,
+                neural_last_status,
+                neural_last_update_unix_seconds,
+                mask_update_failures,
             }
         }
 
@@ -380,12 +546,62 @@ impl MetricsCollector {
         }
     }
 
+    pub fn record_neural_result(&self, _mse: f32, _status: u8) {
+        #[cfg(feature = "metrics")]
+        {
+            self.neural_last_mse.set(_mse as f64);
+            self.neural_last_status.set(_status as f64);
+            self.neural_last_update_unix_seconds
+                .set(Self::unix_timestamp_seconds());
+        }
+    }
+
     /// Record DPI attack detection
     pub fn record_dpi_attack(&self) {
         #[cfg(feature = "metrics")]
         {
             self.dpi_attacks_detected.inc();
             warn!("DPI attack detected!");
+        }
+    }
+
+    pub fn record_telemetry_request_sent(&self) {
+        #[cfg(feature = "metrics")]
+        {
+            self.telemetry_requests_sent.inc();
+        }
+    }
+
+    pub fn record_telemetry_request_failure(&self) {
+        #[cfg(feature = "metrics")]
+        {
+            self.telemetry_request_failures.inc();
+        }
+    }
+
+    pub fn record_telemetry_response(
+        &self,
+        _packet_loss_ratio: f64,
+        _rtt_ms: u16,
+        _jitter_ms: u16,
+        _buffer_pct: u8,
+    ) {
+        #[cfg(feature = "metrics")]
+        {
+            self.telemetry_responses_received.inc();
+            self.telemetry_last_packet_loss_ratio.set(_packet_loss_ratio);
+            self.telemetry_last_rtt_ms.set(_rtt_ms as f64);
+            self.telemetry_last_jitter_ms.set(_jitter_ms as f64);
+            self.telemetry_last_buffer_pct.set(_buffer_pct as f64);
+            self.telemetry_last_update_unix_seconds
+                .set(Self::unix_timestamp_seconds());
+        }
+    }
+
+    pub fn record_mask_update_failure(&self) {
+        #[cfg(feature = "metrics")]
+        {
+            self.mask_update_failures.inc();
         }
     }
 
@@ -480,6 +696,10 @@ mod tests {
         collector.record_handshake_success();
         collector.record_decrypt_failure();
         collector.record_mask_rotation();
+        collector.record_telemetry_request_sent();
+        collector.record_telemetry_response(0.02, 42, 5, 10);
+        collector.record_neural_result(0.11, 2);
+        collector.record_mask_update_failure();
 
         let metrics = collector.gather();
 
@@ -489,5 +709,9 @@ mod tests {
         assert!(metrics.contains("aivpn_handshakes_success_total"));
         assert!(metrics.contains("aivpn_decrypt_failures_total"));
         assert!(metrics.contains("aivpn_mask_rotations_total"));
+        assert!(metrics.contains("aivpn_telemetry_requests_sent_total"));
+        assert!(metrics.contains("aivpn_telemetry_last_rtt_ms"));
+        assert!(metrics.contains("aivpn_neural_last_mse"));
+        assert!(metrics.contains("aivpn_mask_update_failures_total"));
     }
 }
