@@ -302,6 +302,31 @@ fn git_capture(repo: &Path, args: &[&str]) -> Result<String, String> {
     run_capture(command)
 }
 
+fn parse_version_from_toml(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("version") || trimmed.contains("workspace") {
+            return None;
+        }
+        let (_, value) = trimmed.split_once('=')?;
+        let version = value.trim().trim_matches('"');
+        if version.is_empty() {
+            None
+        } else {
+            Some(version.to_string())
+        }
+    })
+}
+
+fn repo_version_at(repo: &Path, rev: Option<&str>) -> Result<String, String> {
+    let content = if let Some(rev) = rev {
+        git_capture(repo, &["show", &format!("{rev}:Cargo.toml")])?
+    } else {
+        std::fs::read_to_string(repo.join("Cargo.toml")).map_err(|err| err.to_string())?
+    };
+    parse_version_from_toml(&content).ok_or_else(|| "workspace version not found in Cargo.toml".to_string())
+}
+
 fn update_status(state: &AppState) -> Response {
     let repo = &state.args.update_repo_dir;
     if !repo.join(".git").exists() {
@@ -345,6 +370,14 @@ fn update_status(state: &AppState) -> Response {
             .map(str::to_string)
             .collect::<Vec<_>>()
     };
+    let local_version = match repo_version_at(repo, None) {
+        Ok(value) => value,
+        Err(err) => return Response::json(500, serde_json::json!({ "error": err })),
+    };
+    let remote_version = match repo_version_at(repo, Some(&upstream)) {
+        Ok(value) => value,
+        Err(err) => return Response::json(500, serde_json::json!({ "error": err })),
+    };
 
     Response::json(
         200,
@@ -356,6 +389,10 @@ fn update_status(state: &AppState) -> Response {
             "remote": remote,
             "localShort": local.chars().take(12).collect::<String>(),
             "remoteShort": remote.chars().take(12).collect::<String>(),
+            "localAdminWebVersion": local_version,
+            "localServerVersion": local_version,
+            "remoteAdminWebVersion": remote_version,
+            "remoteServerVersion": remote_version,
             "commits": commits,
             "upToDate": local == remote
         }),
@@ -1001,13 +1038,15 @@ async function openUpdateDialog() {
   closeButton.textContent = 'Close';
   status.textContent = 'Checking origin...';
   dialog.showModal();
-  try {
-    const data = await api('/api/update/status');
-    const commits = data.upToDate || !data.commits || !data.commits.length
-      ? []
-      : ['', ...data.commits.map(line => `  ${line}`)];
-    status.textContent = [
+    try {
+      const data = await api('/api/update/status');
+      const commits = data.upToDate || !data.commits || !data.commits.length
+        ? []
+        : ['', ...data.commits.map(line => line)];
+      status.textContent = [
       `Repository: ${data.repo}`,
+      `Admin Web: ${data.localAdminWebVersion || '-'} -> ${data.remoteAdminWebVersion || '-'}`,
+      `Server: ${data.localServerVersion || '-'} -> ${data.remoteServerVersion || '-'}`,
       `Remote: ${data.remoteUrl || '-'}`,
       `Current: ${data.localShort}`,
       `Origin: ${data.remoteShort}`,

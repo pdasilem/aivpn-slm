@@ -39,6 +39,9 @@ pub struct NeuralConfig {
     /// MSE threshold for warning
     pub warning_threshold: f32,
 
+    /// Minimum traffic samples required before resonance decisions are allowed
+    pub min_samples_for_check: usize,
+
     /// Enable anomaly detection
     pub enable_anomaly_detection: bool,
 }
@@ -50,6 +53,7 @@ impl Default for NeuralConfig {
             check_interval_secs: 30,
             compromised_threshold: 0.15,
             warning_threshold: 0.08,
+            min_samples_for_check: 128,
             enable_anomaly_detection: true,
         }
     }
@@ -470,6 +474,13 @@ impl NeuralResonanceModule {
         let Some(encoder) = self.encoders.get(mask_id) else {
             return Ok(ResonanceResult::skip("Mask encoder not found"));
         };
+
+        if stats.packet_sizes.len() < self.config.min_samples_for_check
+            || stats.inter_arrivals.len() < self.config.min_samples_for_check
+            || stats.entropy_samples.len() < self.config.min_samples_for_check
+        {
+            return Ok(ResonanceResult::skip("Not enough traffic samples"));
+        }
 
         let features = encode_features(&stats);
         let mse = encoder.reconstruction_error(&features);

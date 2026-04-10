@@ -136,6 +136,7 @@ struct ActiveSessionGuard {
 
 impl Drop for ActiveSessionGuard {
     fn drop(&mut self) {
+        self.session.udp_fd.store(-1, Ordering::SeqCst);
         if let Ok(mut guard) = ACTIVE_SESSION.lock() {
             if let Some(current) = guard.as_ref() {
                 if Arc::ptr_eq(current, &self.session) {
@@ -169,7 +170,9 @@ pub fn stop_active_tunnel() {
         .unwrap_or(-1);
 
     if fd >= 0 {
-        unsafe { libc::close(fd) };
+        unsafe {
+            let _ = libc::shutdown(fd, libc::SHUT_RDWR);
+        };
     }
 }
 

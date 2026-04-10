@@ -3,6 +3,8 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 def keystorePropertiesFile = rootProject.file('keystore.properties')
 def keystoreProperties = new Properties()
 if (keystorePropertiesFile.exists()) {
@@ -28,35 +30,35 @@ android {
         applicationId = "com.aivpn.client"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.5.1"
+        versionCode = 7
+        versionName = "0.5.2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
         if (hasReleaseSigning) {
             release {
-                storeFile file(releaseStoreFile)
-                storePassword releaseStorePassword
-                keyAlias releaseKeyAlias
-                keyPassword releaseKeyPassword
-                enableV1Signing true
-                enableV2Signing true
+                setStoreFile(file(releaseStoreFile))
+                setStorePassword(releaseStorePassword)
+                setKeyAlias(releaseKeyAlias)
+                setKeyPassword(releaseKeyPassword)
+                setEnableV1Signing(true)
+                setEnableV2Signing(true)
             }
         }
     }
 
     buildTypes {
         release {
-            minifyEnabled = false
-            shrinkResources = false
+            setMinifyEnabled(false)
+            setShrinkResources(false)
             if (hasReleaseSigning) {
-                signingConfig signingConfigs.release
+                setSigningConfig(signingConfigs.release)
             }
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             lint {
-                checkReleaseBuilds = false
-                abortOnError = false
+                setCheckReleaseBuilds(false)
+                setAbortOnError(false)
             }
         }
     }
@@ -66,8 +68,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = '17'
+    kotlin {
+        compilerOptions {
+            jvmTarget = JvmTarget.JVM_17
+        }
     }
 
     buildFeatures {
@@ -84,10 +88,10 @@ android {
     // ABI splits — smaller APKs per architecture
     splits {
         abi {
-            enable true
+            enable = true
             reset()
-            include 'arm64-v8a', 'armeabi-v7a'
-            universalApk true
+            include 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+            universalApk = true
         }
     }
 }

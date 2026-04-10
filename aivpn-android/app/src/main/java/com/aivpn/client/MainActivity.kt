@@ -1,6 +1,5 @@
 package com.aivpn.client
 
-import android.app.Activity
 import android.app.AlertDialog
 import android.content.ActivityNotFoundException
 import android.content.Intent
@@ -30,6 +29,9 @@ import java.util.UUID
  * v0.3.0: Uses EncryptedSharedPreferences for secure key storage.
  */
 class MainActivity : AppCompatActivity() {
+    companion object {
+        private const val CONNECTION_KEY_SIZE_BYTES = 32
+    }
 
     private lateinit var binding: ActivityMainBinding
     private var isConnected = false
@@ -37,12 +39,13 @@ class MainActivity : AppCompatActivity() {
     private var profiles = mutableListOf<SecureStorage.ConnectionProfile>()
     private var activeProfileId: String? = null
     private var pendingScanTarget: EditText? = null
+    private var pendingScanNameTarget: EditText? = null
     private var connectionKeyParseError = ""
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
+        if (result.resultCode == RESULT_OK) {
             startVpnService()
         } else {
             Toast.makeText(this, getString(R.string.error_vpn_denied), Toast.LENGTH_SHORT).show()
@@ -52,7 +55,7 @@ class MainActivity : AppCompatActivity() {
     private val qrScanLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+        if (result.resultCode != RESULT_OK) return@registerForActivityResult
         val value = result.data?.getStringExtra("SCAN_RESULT")
             ?: result.data?.getStringExtra("com.google.zxing.client.android.SCAN.RESULT")
             ?: result.data?.dataString
@@ -62,6 +65,13 @@ class MainActivity : AppCompatActivity() {
         }
         pendingScanTarget?.setText(value.trim())
         pendingScanTarget?.setSelection(pendingScanTarget?.text?.length ?: 0)
+        pendingScanNameTarget?.let { nameInput ->
+            if (nameInput.text.toString().trim().isEmpty()) {
+                val nextName = buildDefaultProfileName()
+                nameInput.setText(nextName)
+                nameInput.setSelection(nextName.length)
+            }
+        }
     }
 
     // Connection timer
@@ -210,6 +220,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun buildDefaultProfileName(): String {
+        var index = 1
+        while (true) {
+            val candidate = "Server $index"
+            if (profiles.none { it.name.equals(candidate, ignoreCase = true) }) {
+                return candidate
+            }
+            index++
+        }
+    }
+
     private fun showProfileDialog(existing: SecureStorage.ConnectionProfile?) {
         if (isConnected) return
 
@@ -236,6 +257,15 @@ class MainActivity : AppCompatActivity() {
 
         layout.addView(nameInput)
         layout.addView(keyInput)
+
+        if (existing == null
+            && nameInput.text.toString().trim().isEmpty()
+            && keyInput.text.toString().trim().isEmpty()
+        ) {
+            val defaultName = buildDefaultProfileName()
+            nameInput.setText(defaultName)
+            nameInput.setSelection(defaultName.length)
+        }
 
         val title = if (existing != null)
             getString(R.string.dialog_edit_profile)
@@ -287,7 +317,13 @@ class MainActivity : AppCompatActivity() {
 
         dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
             pendingScanTarget = keyInput
+            pendingScanNameTarget = nameInput
             launchQrScanner()
+        }
+
+        dialog.setOnDismissListener {
+            pendingScanTarget = null
+            pendingScanNameTarget = null
         }
     }
 
@@ -402,9 +438,9 @@ class MainActivity : AppCompatActivity() {
         val serverSigningKey = requiredConnectionKeyField(json, "g") ?: return null
         val psk = requiredConnectionKeyField(json, "p") ?: return null
         val vpnIp = requiredConnectionKeyField(json, "i") ?: return null
-        if (!requireDecodedKeySize("server public key", serverKey, 32)) return null
-        if (!requireDecodedKeySize("server signing key", serverSigningKey, 32)) return null
-        if (!requireDecodedKeySize("preshared key", psk, 32)) return null
+        if (!requireDecodedKeySize("server public key", serverKey)) return null
+        if (!requireDecodedKeySize("server signing key", serverSigningKey)) return null
+        if (!requireDecodedKeySize("preshared key", psk)) return null
         return arrayOf(server, serverKey, serverSigningKey, psk, vpnIp)
     }
 
@@ -418,24 +454,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requireDecodedKeySize(label: String, value: String, expectedSize: Int): Boolean {
+    private fun requireDecodedKeySize(label: String, value: String): Boolean {
         val decoded = try {
             android.util.Base64.decode(value, android.util.Base64.DEFAULT)
         } catch (_: IllegalArgumentException) {
             connectionKeyParseError = resources.getQuantityString(
                 R.plurals.error_connection_key_size,
-                expectedSize,
+                CONNECTION_KEY_SIZE_BYTES,
                 label,
-                expectedSize
+                CONNECTION_KEY_SIZE_BYTES
             )
             return false
         }
-        if (decoded.size != expectedSize) {
+        if (decoded.size != CONNECTION_KEY_SIZE_BYTES) {
             connectionKeyParseError = resources.getQuantityString(
                 R.plurals.error_connection_key_size,
-                expectedSize,
+                CONNECTION_KEY_SIZE_BYTES,
                 label,
-                expectedSize
+                CONNECTION_KEY_SIZE_BYTES
             )
             return false
         }
