@@ -90,10 +90,9 @@ services:
   prometheus:
     image: prom/prometheus:latest
     restart: unless-stopped
+    network_mode: "host"
     ports:
       - "9090:9090"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -102,8 +101,6 @@ services:
       - '--storage.tsdb.path=/prometheus'
       - '--web.console.libraries=/usr/share/prometheus/console_libraries'
       - '--web.console.templates=/usr/share/prometheus/consoles'
-    networks:
-      - aivpn
 
   # Grafana
   grafana:

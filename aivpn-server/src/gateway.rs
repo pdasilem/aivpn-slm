@@ -396,6 +396,11 @@ impl Gateway {
                             ResonanceStatus::Compromised => 3,
                         };
                         metrics.record_neural_result(result.mse, status_code);
+                        if let Some(session) = sessions.get_session(session_id) {
+                            if let Some(client_id) = session.lock().client_id.clone() {
+                                metrics.record_client_neural_result(&client_id, result.mse, status_code);
+                            }
+                        }
                         
                         match result.status {
                             ResonanceStatus::Compromised => {
@@ -467,8 +472,14 @@ impl Gateway {
                 .await
                 {
                     Ok(()) => {
+                        let client_id = sessions
+                            .get_session(&session_id)
+                            .and_then(|session| session.lock().client_id.clone());
                         sessions.update_session_mask(&session_id, new_mask);
                         metrics.record_mask_rotation();
+                        if let Some(client_id) = client_id {
+                            metrics.record_client_mask_rotation(&client_id);
+                        }
                     }
                     Err(err) => {
                         warn!(
@@ -476,6 +487,12 @@ impl Gateway {
                             old_mask_id, err
                         );
                         metrics.record_mask_update_failure();
+                        if let Some(client_id) = sessions
+                            .get_session(&session_id)
+                            .and_then(|session| session.lock().client_id.clone())
+                        {
+                            metrics.record_client_mask_update_failure(&client_id);
+                        }
                     }
                 }
             }
@@ -495,11 +512,18 @@ impl Gateway {
             let active_sessions: Vec<_> = sessions.iter_sessions().map(|entry| entry.value().clone()).collect();
 
             for session in active_sessions {
+                let client_id = session.lock().client_id.clone();
                 if let Err(err) = Self::send_control_packet(&socket, &metrics, &telemetry_request, &session).await {
                     debug!("Telemetry request delivery failed: {}", err);
                     metrics.record_telemetry_request_failure();
+                    if let Some(client_id) = client_id.as_deref() {
+                        metrics.record_client_telemetry_request_failure(client_id);
+                    }
                 } else {
                     metrics.record_telemetry_request_sent();
+                    if let Some(client_id) = client_id.as_deref() {
+                        metrics.record_client_telemetry_request_sent(client_id);
+                    }
                 }
             }
         }
@@ -550,9 +574,10 @@ impl Gateway {
                     
                     // Build encrypted response packet
                     // Minimize lock duration: extract only what we need under lock, then encrypt outside
-                    let (client_addr, tag, mdh, ciphertext) = {
+                    let (client_addr, client_id, tag, mdh, ciphertext) = {
                         let mut sess = session.lock();
                         let client_addr = sess.client_addr;
+                        let client_id = sess.client_id.clone();
                         let seq_num = sess.next_seq() as u16;
                         let (nonce, counter) = sess.next_send_nonce();
                         let key = sess.keys.session_key.clone();
@@ -595,7 +620,7 @@ impl Gateway {
                             time_window,
                         );
                         
-                        (client_addr, tag, mdh, ciphertext)
+                        (client_addr, client_id, tag, mdh, ciphertext)
                     };
                     
                     // Assemble: TAG | MDH | ciphertext
@@ -606,7 +631,12 @@ impl Gateway {
                     
                     // Send to client
                     match socket.send_to(&aivpn_packet, client_addr).await {
-                        Ok(sent) => metrics.record_packet_sent(sent),
+                        Ok(sent) => {
+                            metrics.record_packet_sent(sent);
+                            if let Some(client_id) = client_id.as_deref() {
+                                metrics.record_client_packet_sent(client_id, sent);
+                            }
+                        }
                         Err(e) => debug!("TUN: send failed: {}", e),
                     }
                 }
@@ -744,11 +774,14 @@ impl Gateway {
         let mut is_new_session = false;
         let (session, counter, is_ratcheted_tag) = if let Some(session) = self.session_manager.get_session_by_tag(&tag) {
             // Existing session — validate tag
+            let tag_validation_started = Instant::now();
             let (counter, is_ratcheted) = {
                 let sess = session.lock();
                 sess.validate_tag(&tag)
                     .ok_or(Error::InvalidPacket("Invalid tag"))?
             };
+            self.metrics
+                .record_tag_validation_time(tag_validation_started.elapsed().as_secs_f64());
             (session, counter, is_ratcheted)
         } else if let Some((session, counter, is_ratcheted)) = self.session_manager.refresh_and_find_by_tag(&tag) {
             // Tag not in map — time window may have advanced. Refresh all sessions and retry.
@@ -847,6 +880,7 @@ impl Gateway {
                 db.record_handshake(cid);
                 // Store client_id in session for traffic accounting
                 session.lock().client_id = Some(cid.clone());
+                self.metrics.record_client_handshake_success(cid);
                 info!("Client '{}' authenticated via PSK", cid);
             }
             
@@ -946,7 +980,8 @@ impl Gateway {
         
         // Update session state. Avoid expensive O(window) tag-map rebuild on every packet.
         let mut client_db_flush: Option<(String, u64)> = None;
-        let (session_id, refresh_tags, iat_ms) = {
+        let started = Instant::now();
+        let (session_id, refresh_tags, iat_ms, client_id) = {
             let mut sess = session.lock();
             let now = Instant::now();
             let iat_ms = now.duration_since(sess.last_seen).as_secs_f64() * 1000.0;
@@ -981,7 +1016,7 @@ impl Gateway {
             }
 
             sess.update_fsm();
-            (sess.session_id, refresh_tags, iat_ms)
+            (sess.session_id, refresh_tags, iat_ms, sess.client_id.clone())
         };
         
         // Refresh tag_map only when the precomputed window moves.
@@ -990,6 +1025,9 @@ impl Gateway {
         }
         
         self.metrics.record_packet_received(packet_data.len());
+        if let Some(client_id) = client_id.as_deref() {
+            self.metrics.record_client_packet_received(client_id, packet_data.len());
+        }
 
         // Record traffic stats for neural resonance (Patent 1)
         if self.config.enable_neural {
@@ -1015,6 +1053,9 @@ impl Gateway {
         if !is_new_session {
             self.process_inner_payload(plaintext, &session, client_addr).await?;
         }
+
+        self.metrics
+            .record_processing_time(started.elapsed().as_secs_f64());
         
         Ok(())
     }
@@ -1082,12 +1123,16 @@ impl Gateway {
             ControlPayload::KeyRotate { new_eph_pub } => {
                 info!("Key rotation request from {}", hash_addr(&client_addr));
                 let session_id = session.lock().session_id;
+                let client_id = session.lock().client_id.clone();
                 let hello = self.session_manager.prepare_session_key_rotation(
                     &session_id,
                     new_eph_pub,
                 )?;
                 self.send_control_message(&hello, session).await?;
                 self.metrics.record_key_rotation();
+                if let Some(client_id) = client_id.as_deref() {
+                    self.metrics.record_client_key_rotation(client_id);
+                }
             }
             ControlPayload::MaskUpdate { .. } => {
                 warn!("Unexpected MASK_UPDATE from client");
@@ -1113,12 +1158,16 @@ impl Gateway {
                 self.send_control_message(&response, session).await?;
             }
             ControlPayload::TelemetryResponse { packet_loss, rtt_ms, jitter_ms, buffer_pct } => {
-                let mask_id = session
-                    .lock()
-                    .mask
-                    .as_ref()
-                    .map(|m| m.mask_id.clone())
-                    .unwrap_or_else(|| "webrtc_zoom_v3".to_string());
+                let (mask_id, client_id) = {
+                    let sess = session.lock();
+                    (
+                        sess.mask
+                            .as_ref()
+                            .map(|m| m.mask_id.clone())
+                            .unwrap_or_else(|| "webrtc_zoom_v3".to_string()),
+                        sess.client_id.clone(),
+                    )
+                };
                 self.neural_module
                     .lock()
                     .record_telemetry(&mask_id, packet_loss as f64 / 10_000.0, rtt_ms as f64);
@@ -1128,6 +1177,15 @@ impl Gateway {
                     jitter_ms,
                     buffer_pct,
                 );
+                if let Some(client_id) = client_id.as_deref() {
+                    self.metrics.record_client_telemetry_response(
+                        client_id,
+                        packet_loss as f64 / 10_000.0,
+                        rtt_ms,
+                        jitter_ms,
+                        buffer_pct,
+                    );
+                }
                 debug!(
                     "Telemetry response from {}: mask={}, loss_bps={}, rtt_ms={}, jitter_ms={}, buffer_pct={}",
                     hash_addr(&client_addr),
@@ -1208,9 +1266,15 @@ impl Gateway {
         inner_payload.extend_from_slice(&encoded);
         let packet = Self::build_packet_for_session(&inner_payload, session)?;
 
-        let client_addr = session.lock().client_addr;
+        let (client_addr, client_id) = {
+            let sess = session.lock();
+            (sess.client_addr, sess.client_id.clone())
+        };
         let sent = socket.send_to(&packet, client_addr).await?;
         metrics.record_packet_sent(sent);
+        if let Some(client_id) = client_id.as_deref() {
+            metrics.record_client_packet_sent(client_id, sent);
+        }
         Ok(sent)
     }
     

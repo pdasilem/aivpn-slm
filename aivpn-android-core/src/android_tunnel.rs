@@ -8,7 +8,7 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use jni::objects::GlobalRef;
@@ -48,6 +48,7 @@ pub struct SessionRuntime {
     udp_fd: AtomicI32,
     upload_bytes: AtomicU64,
     download_bytes: AtomicU64,
+    upload_queue_depth: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -106,14 +107,14 @@ impl TelemetryState {
         self.keepalive_acked = self.keepalive_acked.saturating_add(1);
     }
 
-    fn snapshot(&self) -> TelemetrySnapshot {
+    fn snapshot(&self, buffer_pct: u8) -> TelemetrySnapshot {
         let sent = self.keepalive_sent.max(1) as f64;
         let loss_ratio = (self.keepalive_lost as f64 / sent).clamp(0.0, 1.0);
         TelemetrySnapshot {
             packet_loss_bps: (loss_ratio * 10_000.0).round() as u16,
             rtt_ms: self.ewma_rtt_ms.clamp(0.0, u16::MAX as f64).round() as u16,
             jitter_ms: self.ewma_jitter_ms.clamp(0.0, u16::MAX as f64).round() as u16,
-            buffer_pct: 0,
+            buffer_pct,
         }
     }
 }
@@ -124,6 +125,7 @@ impl SessionRuntime {
             udp_fd: AtomicI32::new(-1),
             upload_bytes: AtomicU64::new(0),
             download_bytes: AtomicU64::new(0),
+            upload_queue_depth: AtomicUsize::new(0),
         }
     }
 }
@@ -293,6 +295,7 @@ pub async fn run_tunnel_android(
     let owned_tun_read = unsafe { OwnedFd::from_raw_fd(read_fd) };
     let tun_read = AsyncFd::new(owned_tun_read)?;
 
+    let session_for_tun = session.clone();
     let tun_reader_task = tokio::spawn(async move {
         let mut tun_buf = vec![0u8; BUF_SIZE];
         loop {
@@ -304,7 +307,13 @@ pub async fn run_tunnel_android(
                     if tun_buf[0] >> 4 != 4 {
                         continue;
                     }
+                    session_for_tun
+                        .upload_queue_depth
+                        .fetch_add(1, Ordering::Relaxed);
                     if tun_tx.send(tun_buf[..n].to_vec()).await.is_err() {
+                        session_for_tun
+                            .upload_queue_depth
+                            .fetch_sub(1, Ordering::Relaxed);
                         break;
                     }
                 }
@@ -363,6 +372,9 @@ pub async fn run_tunnel_android(
                 build_zero_mdh_packet(&keys, &mut state.counter, &inner, None)
             }
             fn on_data_sent(&mut self, payload_len: usize) {
+                self.session
+                    .upload_queue_depth
+                    .fetch_sub(1, Ordering::Relaxed);
                 self.session
                     .upload_bytes
                     .fetch_add(payload_len as u64, Ordering::Relaxed);
@@ -505,7 +517,11 @@ pub async fn run_tunnel_android(
                                 let snapshot = telemetry_state
                                     .lock()
                                     .expect("android telemetry state poisoned")
-                                    .snapshot();
+                                    .snapshot(
+                                        ((session.upload_queue_depth.load(Ordering::Relaxed) * 100)
+                                            / CHANNEL_SIZE)
+                                            .min(100) as u8
+                                    );
                                 if control_tx
                                     .send(ControlPayload::TelemetryResponse {
                                         packet_loss: snapshot.packet_loss_bps,

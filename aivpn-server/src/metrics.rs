@@ -11,7 +11,7 @@
 //! - DPI attack detection
 
 #[cfg(feature = "metrics")]
-use prometheus::{Counter, Encoder, Gauge, Histogram, HistogramOpts, Opts, Registry, TextEncoder};
+use prometheus::{Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, Opts, Registry, TextEncoder};
 #[cfg(feature = "metrics")]
 use std::sync::Arc;
 #[cfg(feature = "metrics")]
@@ -118,6 +118,63 @@ pub struct MetricsCollector {
 
     #[cfg(feature = "metrics")]
     mask_update_failures: Counter,
+
+    #[cfg(feature = "metrics")]
+    client_packets_received: CounterVec,
+
+    #[cfg(feature = "metrics")]
+    client_packets_sent: CounterVec,
+
+    #[cfg(feature = "metrics")]
+    client_bytes_received: CounterVec,
+
+    #[cfg(feature = "metrics")]
+    client_bytes_sent: CounterVec,
+
+    #[cfg(feature = "metrics")]
+    client_handshakes_success: CounterVec,
+
+    #[cfg(feature = "metrics")]
+    client_key_rotations: CounterVec,
+
+    #[cfg(feature = "metrics")]
+    client_mask_rotations: CounterVec,
+
+    #[cfg(feature = "metrics")]
+    client_telemetry_requests_sent: CounterVec,
+
+    #[cfg(feature = "metrics")]
+    client_telemetry_request_failures: CounterVec,
+
+    #[cfg(feature = "metrics")]
+    client_telemetry_responses_received: CounterVec,
+
+    #[cfg(feature = "metrics")]
+    client_telemetry_last_packet_loss_ratio: GaugeVec,
+
+    #[cfg(feature = "metrics")]
+    client_telemetry_last_rtt_ms: GaugeVec,
+
+    #[cfg(feature = "metrics")]
+    client_telemetry_last_jitter_ms: GaugeVec,
+
+    #[cfg(feature = "metrics")]
+    client_telemetry_last_buffer_pct: GaugeVec,
+
+    #[cfg(feature = "metrics")]
+    client_telemetry_last_update_unix_seconds: GaugeVec,
+
+    #[cfg(feature = "metrics")]
+    client_neural_last_mse: GaugeVec,
+
+    #[cfg(feature = "metrics")]
+    client_neural_last_status: GaugeVec,
+
+    #[cfg(feature = "metrics")]
+    client_neural_last_update_unix_seconds: GaugeVec,
+
+    #[cfg(feature = "metrics")]
+    client_mask_update_failures: CounterVec,
 }
 
 impl MetricsCollector {
@@ -397,6 +454,141 @@ impl MetricsCollector {
                 .register(Box::new(mask_update_failures.clone()))
                 .unwrap();
 
+            let labels = &["client_id"];
+
+            let client_packets_received = CounterVec::new(
+                Opts::new("aivpn_client_packets_received_total", "Total packets received per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_packets_received.clone())).unwrap();
+
+            let client_packets_sent = CounterVec::new(
+                Opts::new("aivpn_client_packets_sent_total", "Total packets sent per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_packets_sent.clone())).unwrap();
+
+            let client_bytes_received = CounterVec::new(
+                Opts::new("aivpn_client_bytes_received_total", "Total bytes received per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_bytes_received.clone())).unwrap();
+
+            let client_bytes_sent = CounterVec::new(
+                Opts::new("aivpn_client_bytes_sent_total", "Total bytes sent per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_bytes_sent.clone())).unwrap();
+
+            let client_handshakes_success = CounterVec::new(
+                Opts::new("aivpn_client_handshakes_success_total", "Total successful handshakes per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_handshakes_success.clone())).unwrap();
+
+            let client_key_rotations = CounterVec::new(
+                Opts::new("aivpn_client_key_rotations_total", "Total key rotations per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_key_rotations.clone())).unwrap();
+
+            let client_mask_rotations = CounterVec::new(
+                Opts::new("aivpn_client_mask_rotations_total", "Total mask rotations per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_mask_rotations.clone())).unwrap();
+
+            let client_telemetry_requests_sent = CounterVec::new(
+                Opts::new("aivpn_client_telemetry_requests_sent_total", "Telemetry requests sent per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_telemetry_requests_sent.clone())).unwrap();
+
+            let client_telemetry_request_failures = CounterVec::new(
+                Opts::new("aivpn_client_telemetry_request_failures_total", "Telemetry request delivery failures per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_telemetry_request_failures.clone())).unwrap();
+
+            let client_telemetry_responses_received = CounterVec::new(
+                Opts::new("aivpn_client_telemetry_responses_received_total", "Telemetry responses received per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_telemetry_responses_received.clone())).unwrap();
+
+            let client_telemetry_last_packet_loss_ratio = GaugeVec::new(
+                Opts::new("aivpn_client_telemetry_last_packet_loss_ratio", "Latest packet loss ratio per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_telemetry_last_packet_loss_ratio.clone())).unwrap();
+
+            let client_telemetry_last_rtt_ms = GaugeVec::new(
+                Opts::new("aivpn_client_telemetry_last_rtt_ms", "Latest RTT in milliseconds per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_telemetry_last_rtt_ms.clone())).unwrap();
+
+            let client_telemetry_last_jitter_ms = GaugeVec::new(
+                Opts::new("aivpn_client_telemetry_last_jitter_ms", "Latest jitter in milliseconds per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_telemetry_last_jitter_ms.clone())).unwrap();
+
+            let client_telemetry_last_buffer_pct = GaugeVec::new(
+                Opts::new("aivpn_client_telemetry_last_buffer_pct", "Latest upload queue fill percentage per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_telemetry_last_buffer_pct.clone())).unwrap();
+
+            let client_telemetry_last_update_unix_seconds = GaugeVec::new(
+                Opts::new("aivpn_client_telemetry_last_update_unix_seconds", "Unix timestamp of the latest telemetry response per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_telemetry_last_update_unix_seconds.clone())).unwrap();
+
+            let client_neural_last_mse = GaugeVec::new(
+                Opts::new("aivpn_client_neural_last_mse", "Latest neural MSE per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_neural_last_mse.clone())).unwrap();
+
+            let client_neural_last_status = GaugeVec::new(
+                Opts::new("aivpn_client_neural_last_status", "Latest neural status per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_neural_last_status.clone())).unwrap();
+
+            let client_neural_last_update_unix_seconds = GaugeVec::new(
+                Opts::new("aivpn_client_neural_last_update_unix_seconds", "Unix timestamp of the latest neural decision per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_neural_last_update_unix_seconds.clone())).unwrap();
+
+            let client_mask_update_failures = CounterVec::new(
+                Opts::new("aivpn_client_mask_update_failures_total", "Failed server-triggered mask updates per client"),
+                labels,
+            )
+            .unwrap();
+            registry.register(Box::new(client_mask_update_failures.clone())).unwrap();
+
             Self {
                 registry,
                 sessions_total,
@@ -429,6 +621,25 @@ impl MetricsCollector {
                 neural_last_status,
                 neural_last_update_unix_seconds,
                 mask_update_failures,
+                client_packets_received,
+                client_packets_sent,
+                client_bytes_received,
+                client_bytes_sent,
+                client_handshakes_success,
+                client_key_rotations,
+                client_mask_rotations,
+                client_telemetry_requests_sent,
+                client_telemetry_request_failures,
+                client_telemetry_responses_received,
+                client_telemetry_last_packet_loss_ratio,
+                client_telemetry_last_rtt_ms,
+                client_telemetry_last_jitter_ms,
+                client_telemetry_last_buffer_pct,
+                client_telemetry_last_update_unix_seconds,
+                client_neural_last_mse,
+                client_neural_last_status,
+                client_neural_last_update_unix_seconds,
+                client_mask_update_failures,
             }
         }
 
@@ -454,6 +665,14 @@ impl MetricsCollector {
         }
     }
 
+    pub fn record_client_packet_received(&self, _client_id: &str, _bytes: usize) {
+        #[cfg(feature = "metrics")]
+        {
+            self.client_packets_received.with_label_values(&[_client_id]).inc();
+            self.client_bytes_received.with_label_values(&[_client_id]).inc_by(_bytes as f64);
+        }
+    }
+
     /// Record packet sent
     pub fn record_packet_sent(&self, _bytes: usize) {
         #[cfg(feature = "metrics")]
@@ -463,11 +682,26 @@ impl MetricsCollector {
         }
     }
 
+    pub fn record_client_packet_sent(&self, _client_id: &str, _bytes: usize) {
+        #[cfg(feature = "metrics")]
+        {
+            self.client_packets_sent.with_label_values(&[_client_id]).inc();
+            self.client_bytes_sent.with_label_values(&[_client_id]).inc_by(_bytes as f64);
+        }
+    }
+
     /// Record successful handshake
     pub fn record_handshake_success(&self) {
         #[cfg(feature = "metrics")]
         {
             self.handshakes_success.inc();
+        }
+    }
+
+    pub fn record_client_handshake_success(&self, _client_id: &str) {
+        #[cfg(feature = "metrics")]
+        {
+            self.client_handshakes_success.with_label_values(&[_client_id]).inc();
         }
     }
 
@@ -527,11 +761,25 @@ impl MetricsCollector {
         }
     }
 
+    pub fn record_client_mask_rotation(&self, _client_id: &str) {
+        #[cfg(feature = "metrics")]
+        {
+            self.client_mask_rotations.with_label_values(&[_client_id]).inc();
+        }
+    }
+
     /// Record key rotation
     pub fn record_key_rotation(&self) {
         #[cfg(feature = "metrics")]
         {
             self.key_rotations.inc();
+        }
+    }
+
+    pub fn record_client_key_rotation(&self, _client_id: &str) {
+        #[cfg(feature = "metrics")]
+        {
+            self.client_key_rotations.with_label_values(&[_client_id]).inc();
         }
     }
 
@@ -556,6 +804,17 @@ impl MetricsCollector {
         }
     }
 
+    pub fn record_client_neural_result(&self, _client_id: &str, _mse: f32, _status: u8) {
+        #[cfg(feature = "metrics")]
+        {
+            self.client_neural_last_mse.with_label_values(&[_client_id]).set(_mse as f64);
+            self.client_neural_last_status.with_label_values(&[_client_id]).set(_status as f64);
+            self.client_neural_last_update_unix_seconds
+                .with_label_values(&[_client_id])
+                .set(Self::unix_timestamp_seconds());
+        }
+    }
+
     /// Record DPI attack detection
     pub fn record_dpi_attack(&self) {
         #[cfg(feature = "metrics")]
@@ -572,10 +831,24 @@ impl MetricsCollector {
         }
     }
 
+    pub fn record_client_telemetry_request_sent(&self, _client_id: &str) {
+        #[cfg(feature = "metrics")]
+        {
+            self.client_telemetry_requests_sent.with_label_values(&[_client_id]).inc();
+        }
+    }
+
     pub fn record_telemetry_request_failure(&self) {
         #[cfg(feature = "metrics")]
         {
             self.telemetry_request_failures.inc();
+        }
+    }
+
+    pub fn record_client_telemetry_request_failure(&self, _client_id: &str) {
+        #[cfg(feature = "metrics")]
+        {
+            self.client_telemetry_request_failures.with_label_values(&[_client_id]).inc();
         }
     }
 
@@ -598,10 +871,48 @@ impl MetricsCollector {
         }
     }
 
+    pub fn record_client_telemetry_response(
+        &self,
+        _client_id: &str,
+        _packet_loss_ratio: f64,
+        _rtt_ms: u16,
+        _jitter_ms: u16,
+        _buffer_pct: u8,
+    ) {
+        #[cfg(feature = "metrics")]
+        {
+            self.client_telemetry_responses_received
+                .with_label_values(&[_client_id])
+                .inc();
+            self.client_telemetry_last_packet_loss_ratio
+                .with_label_values(&[_client_id])
+                .set(_packet_loss_ratio);
+            self.client_telemetry_last_rtt_ms
+                .with_label_values(&[_client_id])
+                .set(_rtt_ms as f64);
+            self.client_telemetry_last_jitter_ms
+                .with_label_values(&[_client_id])
+                .set(_jitter_ms as f64);
+            self.client_telemetry_last_buffer_pct
+                .with_label_values(&[_client_id])
+                .set(_buffer_pct as f64);
+            self.client_telemetry_last_update_unix_seconds
+                .with_label_values(&[_client_id])
+                .set(Self::unix_timestamp_seconds());
+        }
+    }
+
     pub fn record_mask_update_failure(&self) {
         #[cfg(feature = "metrics")]
         {
             self.mask_update_failures.inc();
+        }
+    }
+
+    pub fn record_client_mask_update_failure(&self, _client_id: &str) {
+        #[cfg(feature = "metrics")]
+        {
+            self.client_mask_update_failures.with_label_values(&[_client_id]).inc();
         }
     }
 
@@ -693,13 +1004,23 @@ mod tests {
         collector.update_session_count(2, 1);
         collector.record_packet_received(128);
         collector.record_packet_sent(64);
+        collector.record_client_packet_received("client-1", 128);
+        collector.record_client_packet_sent("client-1", 64);
         collector.record_handshake_success();
+        collector.record_client_handshake_success("client-1");
         collector.record_decrypt_failure();
         collector.record_mask_rotation();
+        collector.record_client_mask_rotation("client-1");
+        collector.record_key_rotation();
+        collector.record_client_key_rotation("client-1");
         collector.record_telemetry_request_sent();
+        collector.record_client_telemetry_request_sent("client-1");
         collector.record_telemetry_response(0.02, 42, 5, 10);
+        collector.record_client_telemetry_response("client-1", 0.02, 42, 5, 10);
         collector.record_neural_result(0.11, 2);
+        collector.record_client_neural_result("client-1", 0.11, 2);
         collector.record_mask_update_failure();
+        collector.record_client_mask_update_failure("client-1");
 
         let metrics = collector.gather();
 
@@ -713,5 +1034,9 @@ mod tests {
         assert!(metrics.contains("aivpn_telemetry_last_rtt_ms"));
         assert!(metrics.contains("aivpn_neural_last_mse"));
         assert!(metrics.contains("aivpn_mask_update_failures_total"));
+        assert!(metrics.contains("aivpn_client_bytes_received_total"));
+        assert!(metrics.contains("client_id=\"client-1\""));
+        assert!(metrics.contains("aivpn_client_telemetry_last_buffer_pct"));
+        assert!(metrics.contains("aivpn_client_neural_last_status"));
     }
 }

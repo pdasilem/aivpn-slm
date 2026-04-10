@@ -460,6 +460,15 @@
           "expr": "aivpn_telemetry_last_packet_loss_ratio or vector(0)",
           "legendFormat": "loss ratio",
           "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "expr": "aivpn_telemetry_last_buffer_pct or vector(0)",
+          "legendFormat": "buffer pct",
+          "refId": "G"
         }
       ],
       "title": "Telemetry Debug",
