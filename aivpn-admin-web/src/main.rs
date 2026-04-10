@@ -3,6 +3,7 @@
 //! Minimal management web UI that shells out to `aivpn-admin --json`.
 
 use std::collections::HashMap;
+use std::env;
 use std::io::{Read, Write};
 use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
@@ -10,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use clap::Parser;
@@ -69,6 +71,7 @@ struct UpdateJob {
     running: bool,
     finished: bool,
     success: Option<bool>,
+    restart_ready: bool,
     log: Vec<String>,
 }
 
@@ -140,6 +143,7 @@ fn route_request(request: &Request, state: &AppState) -> Response {
         ("GET", "/api/auth/status") => auth_status(state),
         ("GET", "/api/update/status") => update_status(state),
         ("POST", "/api/update/run") => run_update(state),
+        ("POST", "/api/update/restart-admin-web") => restart_admin_web(state),
         ("GET", "/api/update/log") => update_log(state),
         ("POST", "/api/admin-token/generate") => generate_admin_token(state),
         ("GET", "/api/clients") => admin_json(&state.args, &["client", "list"]),
@@ -376,6 +380,7 @@ fn run_update(state: &AppState) -> Response {
             running: true,
             finished: false,
             success: None,
+            restart_ready: false,
             log: vec!["Starting update...".to_string()],
         };
     }
@@ -388,8 +393,11 @@ fn run_update(state: &AppState) -> Response {
         guard.running = false;
         guard.finished = true;
         guard.success = Some(result.is_ok());
+        guard.restart_ready = result.is_ok();
         match result {
-            Ok(()) => guard.log.push("Update command finished. Services may still be restarting.".to_string()),
+            Ok(()) => guard
+                .log
+                .push("Update finished. Press Restart to rebuild and restart the admin panel.".to_string()),
             Err(err) => guard.log.push(format!("Update failed: {err}")),
         }
     });
@@ -408,9 +416,48 @@ fn update_log(state: &AppState) -> Response {
             "running": job.running,
             "finished": job.finished,
             "success": job.success,
+            "restartReady": job.restart_ready,
             "log": job.log.join("\n")
         }),
     )
+}
+
+fn restart_admin_web(state: &AppState) -> Response {
+    let repo = state.args.update_repo_dir.clone();
+    let compose_file = repo.join("docker-compose.yml");
+    if !compose_file.exists() {
+        return Response::json(
+            500,
+            serde_json::json!({ "error": format!("docker-compose.yml not found: {}", compose_file.display()) }),
+        );
+    }
+
+    {
+        let job = state.update_job.lock().expect("update job lock");
+        if job.running {
+            return Response::json(409, serde_json::json!({ "error": "update still running" }));
+        }
+        if !job.restart_ready || job.success != Some(true) {
+            return Response::json(409, serde_json::json!({ "error": "admin-web restart is only available after a successful update" }));
+        }
+    }
+
+    match spawn_admin_web_restart_helper(&repo, &compose_file) {
+        Ok(helper_name) => {
+            append_update_log(
+                &state.update_job,
+                format!("Admin UI restart helper started: {helper_name}"),
+            );
+            Response::json(
+                202,
+                serde_json::json!({
+                    "message": "Admin UI restart scheduled",
+                    "reloadAfterMs": 6000
+                }),
+            )
+        }
+        Err(err) => Response::json(500, serde_json::json!({ "error": err })),
+    }
 }
 
 fn append_update_log(job: &Arc<Mutex<UpdateJob>>, line: impl Into<String>) {
@@ -462,10 +509,8 @@ fn run_logged_command(mut command: Command, label: &str, job: Arc<Mutex<UpdateJo
 }
 
 fn run_update_job(repo: PathBuf, job: Arc<Mutex<UpdateJob>>) -> Result<(), String> {
-    append_update_log(
-        &job,
-        "Note: aivpn-admin-web will restart at the end of the update. This page may disconnect; reload it after a few seconds.",
-    );
+    append_update_log(&job, "Note: the admin panel will not restart automatically anymore.");
+    append_update_log(&job, "After the update finishes, press Restart in this dialog.");
 
     let mut pull = Command::new("git");
     pull.arg("-c")
@@ -501,8 +546,9 @@ fn run_update_job(repo: PathBuf, job: Arc<Mutex<UpdateJob>>) -> Result<(), Strin
                 .arg("build")
                 .arg("aivpn-admin-web");
             run_logged_command(build_admin_web, "docker compose build aivpn-admin-web", job.clone())?;
-
-            schedule_admin_web_restart(&repo, &compose_file, job)
+            append_update_log(&job, "Admin panel image rebuilt successfully.");
+            append_update_log(&job, "Press Restart to recreate aivpn-admin-web with the new image.");
+            Ok(())
         }
         Err(err) => {
             append_update_log(&job, format!("docker compose failed: {err}"));
@@ -511,24 +557,64 @@ fn run_update_job(repo: PathBuf, job: Arc<Mutex<UpdateJob>>) -> Result<(), Strin
     }
 }
 
-fn schedule_admin_web_restart(
-    repo: &Path,
-    compose_file: &Path,
-    job: Arc<Mutex<UpdateJob>>,
-) -> Result<(), String> {
-    append_update_log(&job, "Scheduling aivpn-admin-web restart in 2 seconds...");
+fn spawn_admin_web_restart_helper(repo: &Path, compose_file: &Path) -> Result<String, String> {
+    let image = current_container_image()?;
+    let helper_name = format!(
+        "aivpn-admin-web-restart-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default()
+    );
     let command = format!(
-        "sleep 2; docker compose -f {} --project-directory {} up -d --no-build aivpn-admin-web >/tmp/aivpn-admin-web-restart.log 2>&1",
+        "docker compose -f {} --project-directory {} up -d --build aivpn-admin-web",
         shell_quote(compose_file),
         shell_quote(repo),
     );
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("{command} &"))
-        .spawn()
+
+    let status = Command::new("docker")
+        .arg("run")
+        .arg("-d")
+        .arg("--rm")
+        .arg("--name")
+        .arg(&helper_name)
+        .arg("-v")
+        .arg("/var/run/docker.sock:/var/run/docker.sock")
+        .arg("-v")
+        .arg(format!("{}:{}", repo.display(), repo.display()))
+        .arg("-w")
+        .arg(repo)
+        .arg(image)
+        .arg("sh")
+        .arg("-lc")
+        .arg(command)
+        .status()
         .map_err(|err| err.to_string())?;
-    append_update_log(&job, "Admin UI restart scheduled. Reload this page after it disconnects.");
-    Ok(())
+
+    if status.success() {
+        Ok(helper_name)
+    } else {
+        Err(format!("failed to start admin-web restart helper: {status}"))
+    }
+}
+
+fn current_container_image() -> Result<String, String> {
+    let container_id = env::var("HOSTNAME").map_err(|err| err.to_string())?;
+    let output = Command::new("docker")
+        .arg("inspect")
+        .arg(&container_id)
+        .arg("--format")
+        .arg("{{.Config.Image}}")
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(format!("docker inspect self failed: {}", output.status));
+    }
+    let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if image.is_empty() {
+        return Err("current container image is empty".into());
+    }
+    Ok(image)
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -856,7 +942,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <pre id="updateStatus">Loading...</pre>
       <div class="row">
         <button id="runUpdateButton" onclick="runUpdate()" disabled>Update now</button>
-        <button id="closeUpdateButton" onclick="document.getElementById('updateDialog').close()">Cancel</button>
+        <button id="restartUpdateButton" onclick="restartAdminWeb()" hidden>Restart</button>
+        <button id="closeUpdateButton" onclick="document.getElementById('updateDialog').close()">Close</button>
       </div>
     </div>
   </dialog>
@@ -904,9 +991,14 @@ async function openUpdateDialog() {
   const dialog = document.getElementById('updateDialog');
   const status = document.getElementById('updateStatus');
   const button = document.getElementById('runUpdateButton');
+  const restartButton = document.getElementById('restartUpdateButton');
   const closeButton = document.getElementById('closeUpdateButton');
   button.disabled = true;
+  button.hidden = false;
+  restartButton.hidden = true;
+  restartButton.disabled = true;
   closeButton.disabled = false;
+  closeButton.textContent = 'Close';
   status.textContent = 'Checking origin...';
   dialog.showModal();
   try {
@@ -934,10 +1026,15 @@ async function runUpdate() {
   if (!confirm('Update from origin and restart AIVPN services? Admin UI restart is handled separately so this log can stay visible.')) return;
   const status = document.getElementById('updateStatus');
   const button = document.getElementById('runUpdateButton');
+  const restartButton = document.getElementById('restartUpdateButton');
   const closeButton = document.getElementById('closeUpdateButton');
   updateRunning = true;
   button.disabled = true;
+  button.hidden = false;
+  restartButton.hidden = true;
+  restartButton.disabled = true;
   closeButton.disabled = true;
+  closeButton.textContent = 'Close';
   status.textContent = 'Starting update...\n';
   try {
     await api('/api/update/run', {method: 'POST'});
@@ -953,6 +1050,7 @@ async function pollUpdateLog() {
   if (updatePollTimer) clearTimeout(updatePollTimer);
   const status = document.getElementById('updateStatus');
   const button = document.getElementById('runUpdateButton');
+  const restartButton = document.getElementById('restartUpdateButton');
   const closeButton = document.getElementById('closeUpdateButton');
   try {
     const data = await api('/api/update/log');
@@ -961,19 +1059,51 @@ async function pollUpdateLog() {
     if (wasAtBottom) status.scrollTop = status.scrollHeight;
     if (data.running) {
       button.disabled = true;
+      restartButton.disabled = true;
+      restartButton.hidden = true;
       closeButton.disabled = true;
       updatePollTimer = setTimeout(pollUpdateLog, 1000);
     } else {
       updateRunning = false;
-      button.disabled = data.success !== false;
+      button.hidden = true;
+      button.disabled = true;
+      restartButton.hidden = !(data.success === true && data.restartReady);
+      restartButton.disabled = !(data.success === true && data.restartReady);
       closeButton.disabled = false;
+      closeButton.textContent = data.success === true ? 'Close' : 'Close';
       if (data.success === false) {
         status.textContent += '\n\nUpdate failed. You can retry after checking the log.';
+        button.hidden = false;
+        button.disabled = false;
+        button.textContent = 'Update now';
       }
     }
   } catch (err) {
     status.textContent += `\n\nLog polling failed: ${err.message || err}`;
     updateRunning = false;
+    closeButton.disabled = false;
+  }
+}
+
+async function restartAdminWeb() {
+  const status = document.getElementById('updateStatus');
+  const restartButton = document.getElementById('restartUpdateButton');
+  const closeButton = document.getElementById('closeUpdateButton');
+  restartButton.disabled = true;
+  closeButton.disabled = true;
+  status.textContent += '\n\nStarting admin panel restart...';
+  try {
+    const data = await api('/api/update/restart-admin-web', {method: 'POST'});
+    status.textContent += `\n${data.message || 'Admin UI restart scheduled.'}`;
+    const reloadAfterMs = data.reloadAfterMs || 6000;
+    setTimeout(() => {
+      const url = new URL(window.location.href);
+      url.searchParams.set('reload', Date.now().toString());
+      window.location.replace(url.toString());
+    }, reloadAfterMs);
+  } catch (err) {
+    status.textContent += `\nRestart failed: ${err.message || err}`;
+    restartButton.disabled = false;
     closeButton.disabled = false;
   }
 }

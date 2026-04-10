@@ -61,10 +61,6 @@ EXPOSE 443/udp
 EXPOSE 9100/tcp
 EXPOSE 27449/tcp
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD test "$(basename "$(readlink /proc/1/exe 2>/dev/null)")" = "aivpn-server" || exit 1
-
 # Run as root (required for TUN device and NAT)
 ENTRYPOINT ["/usr/local/bin/aivpn-server"]
 CMD ["--listen", "0.0.0.0:443", "--key-file", "/etc/aivpn/server.key"]
