@@ -898,6 +898,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     input, button, textarea, pre { border-radius: 8px; border: 1px solid var(--border-strong); padding: 9px 10px; background: var(--panel-2); color: var(--text); }
     button, .button-link { cursor: pointer; background: var(--button); color: var(--text); text-decoration: none; display: inline-flex; align-items: center; justify-content: center; min-height: 20px; border-radius: 8px; border: 1px solid var(--border-strong); padding: 9px 10px; }
     button:hover, .button-link:hover { background: var(--button-hover); }
+    button:disabled, button[disabled] { opacity: 0.45; cursor: not-allowed; background: color-mix(in srgb, var(--button) 75%, var(--bg)); color: var(--muted); border-color: var(--border); box-shadow: none; pointer-events: none; }
     table { width: 100%; border-collapse: collapse; }
     th, td { border-bottom: 1px solid var(--border); padding: 10px; text-align: left; vertical-align: top; }
     code, textarea, pre { width: 100%; box-sizing: border-box; word-break: break-all; }
@@ -979,7 +980,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <pre id="updateStatus">Loading...</pre>
       <div class="row">
         <button id="runUpdateButton" onclick="runUpdate()" disabled>Update now</button>
-        <button id="restartUpdateButton" onclick="restartAdminWeb()" hidden>Restart</button>
+        <button id="restartUpdateButton" onclick="restartAdminWeb()" disabled>Restart</button>
         <button id="closeUpdateButton" onclick="document.getElementById('updateDialog').close()">Close</button>
       </div>
     </div>
@@ -1030,9 +1031,8 @@ async function openUpdateDialog() {
   const button = document.getElementById('runUpdateButton');
   const restartButton = document.getElementById('restartUpdateButton');
   const closeButton = document.getElementById('closeUpdateButton');
+  updateRunning = false;
   button.disabled = true;
-  button.hidden = false;
-  restartButton.hidden = true;
   restartButton.disabled = true;
   closeButton.disabled = false;
   closeButton.textContent = 'Close';
@@ -1069,8 +1069,6 @@ async function runUpdate() {
   const closeButton = document.getElementById('closeUpdateButton');
   updateRunning = true;
   button.disabled = true;
-  button.hidden = false;
-  restartButton.hidden = true;
   restartButton.disabled = true;
   closeButton.disabled = true;
   closeButton.textContent = 'Close';
@@ -1099,20 +1097,15 @@ async function pollUpdateLog() {
     if (data.running) {
       button.disabled = true;
       restartButton.disabled = true;
-      restartButton.hidden = true;
       closeButton.disabled = true;
       updatePollTimer = setTimeout(pollUpdateLog, 1000);
     } else {
       updateRunning = false;
-      button.hidden = true;
-      button.disabled = true;
-      restartButton.hidden = !(data.success === true && data.restartReady);
+      button.disabled = data.success === true;
       restartButton.disabled = !(data.success === true && data.restartReady);
       closeButton.disabled = false;
-      closeButton.textContent = data.success === true ? 'Close' : 'Close';
       if (data.success === false) {
         status.textContent += '\n\nUpdate failed. You can retry after checking the log.';
-        button.hidden = false;
         button.disabled = false;
         button.textContent = 'Update now';
       }
