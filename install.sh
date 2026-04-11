@@ -7,6 +7,7 @@ ENV_FILE=".env"
 VPN_SUBNET="10.0.0.0/24"
 VPN_PORT="443"
 ADMIN_PORT="27449"
+GRAFANA_PORT="3000"
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -140,6 +141,13 @@ server_host_for_urls() {
   [ -n "$endpoint" ] || die "AIVPN_SERVER_IP is missing in ${ENV_FILE}. Install AIVPN or fix the configuration."
   host="$(endpoint_host "$endpoint")"
   [ -n "$host" ] || die "AIVPN_SERVER_IP is invalid in ${ENV_FILE}: ${endpoint}"
+  printf '%s' "$host"
+}
+
+access_host_for_urls() {
+  local host
+  host="$(read_env_value AIVPN_ACCESS_HOST)"
+  [ -n "$host" ] || die "AIVPN_ACCESS_HOST is missing in ${ENV_FILE}. Install AIVPN or fix the configuration."
   printf '%s' "$host"
 }
 
@@ -279,6 +287,17 @@ prepare_settings_from_scratch() {
   endpoint="$(ask_value "Public VPN endpoint for clients (IP-or-DNS:port)" "$default_endpoint")"
   write_env_value "AIVPN_SERVER_IP" "$endpoint"
 
+  local default_access_host access_host
+  default_access_host="$(detect_tailscale_ip)"
+  if [ -z "$default_access_host" ]; then
+    default_access_host="127.0.0.1"
+  fi
+  access_host="$(ask_value "Access bind host for Admin UI and Grafana" "$default_access_host")"
+  write_env_value "AIVPN_ACCESS_HOST" "$access_host"
+  write_env_value "AIVPN_GRAFANA_PUBLIC_URL" "http://${access_host}:${GRAFANA_PORT}/"
+  remove_env_value "AIVPN_ADMIN_BIND_HOST"
+  remove_env_value "AIVPN_GRAFANA_BIND_HOST"
+
   if confirm "Generate admin UI token?"; then
     local token
     token="$(openssl rand -base64 32)"
@@ -374,10 +393,10 @@ print_access_info() {
   else
     token_state="disabled"
   fi
-  host="$(server_host_for_urls)"
+  host="$(access_host_for_urls)"
 
   printf '\nAdmin UI: http://%s:%s/\n' "$host" "$ADMIN_PORT"
-  printf 'Grafana: http://%s:3000/ (default login: admin / admin)\n' "$host"
+  printf 'Grafana: http://%s:%s/ (default login: admin / admin)\n' "$host" "$GRAFANA_PORT"
   printf 'Admin token: %s\n' "$token_state"
   printf 'Metrics: http://127.0.0.1:9100/metrics or through Prometheus\n'
 }
@@ -387,13 +406,15 @@ firewall_check() {
   printf 'Default outbound interface: %s\n' "$(default_route_iface || true)"
   printf 'Expected VPN UDP port: %s/udp\n' "$VPN_PORT"
   printf 'Expected admin UI TCP port: %s/tcp\n' "$ADMIN_PORT"
+  printf 'Expected Grafana TCP port: %s/tcp\n' "$GRAFANA_PORT"
   printf 'Expected VPN subnet for NAT: %s\n\n' "$VPN_SUBNET"
 
   if command -v tailscale >/dev/null 2>&1; then
     printf 'Tailscale: installed\n'
     printf 'Tailscale IPv4: %s\n' "$(detect_tailscale_ip)"
     tailscale status 2>/dev/null | sed -n '1,8p' || true
-    printf '\nTailscale access can be configured separately by binding the admin UI to a Tailscale-only interface or by firewalling the admin port to tailscale0.\n\n'
+    printf '\nRecommended default: use the Tailscale IPv4 shown above as AIVPN_ACCESS_HOST.\n'
+    printf 'You can also use 127.0.0.1 for SSH tunnel or reverse proxy scenarios, or a public IP if you intentionally expose access.\n\n'
   else
     printf 'Tailscale: not installed or not in PATH\n\n'
   fi
@@ -403,7 +424,8 @@ firewall_check() {
     run_privileged_or_print ufw status verbose
     printf '\nRecommended rules if UFW is active:\n'
     printf '  sudo ufw allow %s/udp\n' "$VPN_PORT"
-    printf '  sudo ufw allow in on tailscale0 to any port %s proto tcp\n\n' "$ADMIN_PORT"
+    printf '  sudo ufw allow in on tailscale0 to any port %s proto tcp\n' "$ADMIN_PORT"
+    printf '  sudo ufw allow in on tailscale0 to any port %s proto tcp\n\n' "$GRAFANA_PORT"
   fi
 
   if command -v firewall-cmd >/dev/null 2>&1; then

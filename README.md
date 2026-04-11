@@ -114,9 +114,9 @@ cd /opt/aivpn
 ./install.sh
 ```
 
-It can install through Docker Compose, enable IP forwarding, add the required iptables NAT MASQUERADE rule, update from git while preserving `config/`, uninstall with an option to keep settings, write `AIVPN_SERVER_IP` into `.env`, generate the admin UI token, start Prometheus/Grafana, and run firewall/Tailscale diagnostics.
+It can install through Docker Compose, enable IP forwarding, add the required iptables NAT MASQUERADE rule, update from git while preserving `config/`, uninstall with an option to keep settings, write `AIVPN_SERVER_IP` into `.env`, choose an access host for Admin UI and Grafana, generate the admin UI token, start Prometheus/Grafana, and run firewall/Tailscale diagnostics.
 
-> **Admin UI security:** do not expose the admin UI directly to the public internet. It can add, remove, disable clients and trigger updates/restarts, so access must be restricted with Tailscale, an SSH tunnel, firewall rules, or another controlled private access layer. Use an admin token as an additional guard, not as the only boundary.
+> **Admin UI and Grafana security:** `AIVPN_ACCESS_HOST` controls which bind address and direct access host both services use. Typical values are a Tailscale IP, `127.0.0.1`, or a public IP if you intentionally expose access. For SSH tunnel or reverse-proxy setups, keep `AIVPN_ACCESS_HOST=127.0.0.1` and publish the service through that separate layer. The admin token is an additional guard, not the main security boundary.
 
 ### 1. Clone the repo
 
@@ -154,12 +154,17 @@ chmod 600 config/server.key
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
 
-# Build and start. Replace the placeholder with your server public IP or DNS name.
-echo "AIVPN_SERVER_IP=YOUR_PUBLIC_IP:443" > .env
+# Build and start. Replace the public endpoint for client keys. Set AIVPN_ACCESS_HOST
+# to the host through which you want to reach Admin UI and Grafana.
+cat > .env <<'EOF'
+AIVPN_SERVER_IP=YOUR_PUBLIC_IP:443
+AIVPN_ACCESS_HOST=YOUR_TAILSCALE_IP_OR_127.0.0.1
+AIVPN_GRAFANA_PUBLIC_URL=http://YOUR_TAILSCALE_IP_OR_127.0.0.1:3000/
+EOF
 docker compose up -d --build aivpn-server aivpn-admin-web prometheus grafana
 ```
 
-> The container runs with `network_mode: "host"` and mounts `./config` → `/etc/aivpn` inside the container.
+> `aivpn-server`, `prometheus`, and `grafana` run with `network_mode: "host"`. Admin UI is published only on `AIVPN_ACCESS_HOST`, and Grafana binds only to `AIVPN_ACCESS_HOST`.
 
 #### Option B: Bare metal
 

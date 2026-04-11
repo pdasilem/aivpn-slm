@@ -81,11 +81,7 @@ async fn main() {
         [0u8; 32]
     };
 
-    // Generate random TUN name if not specified (MED-1: avoids fingerprinting)
-    let tun_name = args.tun_name.unwrap_or_else(|| {
-        use rand::Rng;
-        format!("tun{:04x}", rand::thread_rng().gen::<u16>())
-    });
+    let tun_name = args.tun_name.unwrap_or_else(|| "aivpn0".to_string());
 
     // Create config
     let config = GatewayConfig {

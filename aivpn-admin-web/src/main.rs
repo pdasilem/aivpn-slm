@@ -57,6 +57,10 @@ struct Args {
     /// Host repository path used by the Admin Web update action
     #[arg(long, default_value = "/opt/aivpn", env = "AIVPN_UPDATE_REPO_DIR")]
     update_repo_dir: PathBuf,
+
+    /// Explicit Grafana URL used by the UI button
+    #[arg(long, env = "AIVPN_GRAFANA_PUBLIC_URL")]
+    grafana_public_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -117,6 +121,13 @@ fn main() {
     }
 }
 
+fn grafana_public_url(args: &Args) -> String {
+    args.grafana_public_url
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:3000/".to_string())
+}
+
 fn handle_stream(mut stream: TcpStream, state: &AppState) -> std::io::Result<()> {
     let request = match read_request(&mut stream) {
         Ok(request) => request,
@@ -139,7 +150,7 @@ fn route_request(request: &Request, state: &AppState) -> Response {
     }
 
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") => Response::html(200, INDEX_HTML),
+        ("GET", "/") => Response::html(200, &index_html(&state.args)),
         ("GET", "/api/auth/status") => auth_status(state),
         ("GET", "/api/update/status") => update_status(state),
         ("POST", "/api/update/run") => run_update(state),
@@ -696,6 +707,12 @@ fn load_initial_token(args: &Args) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
+fn index_html(args: &Args) -> String {
+    let grafana_url_json = serde_json::to_string(&grafana_public_url(args))
+        .unwrap_or_else(|_| "\"http://127.0.0.1:3000/\"".to_string());
+    INDEX_HTML.replace("__GRAFANA_PUBLIC_URL__", &grafana_url_json)
+}
+
 fn generate_admin_token(state: &AppState) -> Response {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -990,7 +1007,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 const tokenInput = document.getElementById('token');
 tokenInput.value = localStorage.getItem('aivpnAdminToken') || '';
 document.documentElement.dataset.theme = localStorage.getItem('aivpnTheme') || 'dark';
-document.getElementById('grafanaLink').href = `${location.protocol}//${location.hostname}:3000/`;
+document.getElementById('grafanaLink').href = __GRAFANA_PUBLIC_URL__;
 let currentConnectionKey = '';
 let updatePollTimer = null;
 let updateRunning = false;

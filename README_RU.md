@@ -101,9 +101,9 @@ cd /opt/aivpn
 - удалить AIVPN с выбором, сохранять ли настройки;
 - проверить firewall/Tailscale/UFW/firewalld/nftables/iptables.
 
-Во время установки скрипт предложит публичный адрес сервера для клиентских ключей, запишет его в `.env` как `AIVPN_SERVER_IP`, спросит, генерировать ли admin token, затем запустит сервер, admin UI, Prometheus и Grafana. Если токен включен, его надо вставить в поле `Admin token` в web UI и нажать `Use token`.
+Во время установки скрипт предложит публичный адрес сервера для клиентских ключей, затем отдельный host доступа для Admin UI и Grafana, запишет это в `.env`, спросит, генерировать ли admin token, затем запустит сервер, admin UI, Prometheus и Grafana. Если токен включен, его надо вставить в поле `Admin token` в web UI и нажать `Use token`.
 
-> **Безопасность admin UI:** не открывайте admin UI напрямую в публичный интернет. Через него можно добавлять, удалять, отключать клиентов и запускать обновление/перезапуск сервисов, поэтому доступ должен быть ограничен через Tailscale, SSH tunnel, правила firewall или другой контролируемый приватный доступ. Admin token используйте как дополнительную защиту, а не как единственный барьер.
+> **Безопасность Admin UI и Grafana:** `AIVPN_ACCESS_HOST` определяет bind-адрес и прямой адрес доступа для обоих сервисов. Обычно это Tailscale IP, `127.0.0.1` или публичный IP, если вы осознанно открываете доступ. Для SSH-туннеля или reverse proxy оставляйте `AIVPN_ACCESS_HOST=127.0.0.1` и публикуйте сервисы уже через этот отдельный слой. Admin token — дополнительная защита, а не основной барьер.
 
 ### 1. Клонируем репозиторий
 
@@ -141,12 +141,17 @@ chmod 600 config/server.key
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
 
-# Собираем и запускаем. Замените IP на публичный IP или DNS вашего сервера.
-echo "AIVPN_SERVER_IP=ВАШ_ПУБЛИЧНЫЙ_IP:443" > .env
+# Собираем и запускаем. Публичный endpoint нужен только для клиентских ключей.
+# AIVPN_ACCESS_HOST задает адрес, через который будут доступны Admin UI и Grafana.
+cat > .env <<'EOF'
+AIVPN_SERVER_IP=ВАШ_ПУБЛИЧНЫЙ_IP:443
+AIVPN_ACCESS_HOST=ВАШ_TAILSCALE_IP_ИЛИ_127.0.0.1
+AIVPN_GRAFANA_PUBLIC_URL=http://ВАШ_TAILSCALE_IP_ИЛИ_127.0.0.1:3000/
+EOF
 docker compose up -d --build aivpn-server aivpn-admin-web prometheus grafana
 ```
 
-> Контейнер запускается с `network_mode: "host"` и монтирует `./config` → `/etc/aivpn` внутри контейнера.
+> `aivpn-server`, `prometheus` и `grafana` работают с `network_mode: "host"`. Admin UI публикуется только на `AIVPN_ACCESS_HOST`, и Grafana привязывается только к `AIVPN_ACCESS_HOST`.
 
 #### Вариант Б: На голом железе
 
