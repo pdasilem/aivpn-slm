@@ -45,6 +45,10 @@ impl Default for UploadConfig {
 pub trait PacketEncryptor: Send {
     /// Encrypt a TUN data payload into a ready-to-send UDP datagram.
     fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>>;
+    /// Encrypt a TUN payload into one or more UDP datagrams.
+    fn encrypt_data_many(&mut self, payload: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.encrypt_data(payload).map(|pkt| vec![pkt])
+    }
     /// Encrypt a keepalive control message into a ready-to-send UDP datagram.
     fn encrypt_keepalive(&mut self) -> Result<Vec<u8>>;
     /// Encrypt an arbitrary control message into a ready-to-send UDP datagram.
@@ -155,16 +159,20 @@ pub async fn run_upload_loop(
                     None => return Err(Error::Channel("TUN->UDP channel closed".into())),
                 };
 
-                let encrypted = enc.encrypt_data(&pkt_data)?;
-                send_tolerant(udp, &encrypted).await?;
+                let encrypted_packets = enc.encrypt_data_many(&pkt_data)?;
+                for encrypted in &encrypted_packets {
+                    send_tolerant(udp, encrypted).await?;
+                }
                 enc.on_data_sent(pkt_data.len());
 
                 // Burst drain: process up to burst_size without yielding
                 for _ in 0..config.burst_size {
                     match rx.try_recv() {
                         Ok(pkt) => {
-                            let encrypted = enc.encrypt_data(&pkt)?;
-                            send_tolerant(udp, &encrypted).await?;
+                            let encrypted_packets = enc.encrypt_data_many(&pkt)?;
+                            for encrypted in &encrypted_packets {
+                                send_tolerant(udp, encrypted).await?;
+                            }
                             enc.on_data_sent(pkt.len());
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,

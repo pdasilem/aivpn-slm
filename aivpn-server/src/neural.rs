@@ -17,6 +17,7 @@
 //! High MSE → traffic deviates from mask signature → DPI compromise detected
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tracing::{info, debug};
 
@@ -44,6 +45,21 @@ pub struct NeuralConfig {
 
     /// Enable anomaly detection
     pub enable_anomaly_detection: bool,
+
+    /// Consecutive warning checks required before reporting warning.
+    pub warning_streak_required: usize,
+
+    /// Consecutive compromised checks required before reporting compromise.
+    pub compromised_streak_required: usize,
+
+    /// Cooldown after a successful mask rotation.
+    pub rotation_cooldown_secs: u64,
+
+    /// Jitter threshold that participates in anomaly decisions.
+    pub anomalous_jitter_ms: f64,
+
+    /// Upload-queue fill threshold that participates in anomaly decisions.
+    pub anomalous_buffer_pct: u8,
 }
 
 impl Default for NeuralConfig {
@@ -55,6 +71,11 @@ impl Default for NeuralConfig {
             warning_threshold: 0.08,
             min_samples_for_check: 128,
             enable_anomaly_detection: true,
+            warning_streak_required: 2,
+            compromised_streak_required: 3,
+            rotation_cooldown_secs: 180,
+            anomalous_jitter_ms: 150.0,
+            anomalous_buffer_pct: 85,
         }
     }
 }
@@ -303,6 +324,8 @@ pub fn encode_features(stats: &TrafficStats) -> [f32; FEAT_DIM] {
 pub struct AnomalyDetector {
     mask_packet_loss: HashMap<String, Vec<f64>>,
     mask_rtt: HashMap<String, Vec<f64>>,
+    mask_jitter: HashMap<String, Vec<f64>>,
+    mask_buffer_pct: HashMap<String, Vec<u8>>,
     baseline_loss: f64,
     baseline_rtt: f64,
 }
@@ -312,12 +335,21 @@ impl AnomalyDetector {
         Self {
             mask_packet_loss: HashMap::new(),
             mask_rtt: HashMap::new(),
+            mask_jitter: HashMap::new(),
+            mask_buffer_pct: HashMap::new(),
             baseline_loss: 0.01,
             baseline_rtt: 50.0,
         }
     }
 
-    pub fn record_metrics(&mut self, mask_id: &str, packet_loss: f64, rtt_ms: f64) {
+    pub fn record_metrics(
+        &mut self,
+        mask_id: &str,
+        packet_loss: f64,
+        rtt_ms: f64,
+        jitter_ms: f64,
+        buffer_pct: u8,
+    ) {
         let losses = self.mask_packet_loss.entry(mask_id.to_string()).or_default();
         losses.push(packet_loss);
         if losses.len() > 100 { losses.remove(0); }
@@ -325,9 +357,22 @@ impl AnomalyDetector {
         let rtts = self.mask_rtt.entry(mask_id.to_string()).or_default();
         rtts.push(rtt_ms);
         if rtts.len() > 100 { rtts.remove(0); }
+
+        let jitters = self.mask_jitter.entry(mask_id.to_string()).or_default();
+        jitters.push(jitter_ms);
+        if jitters.len() > 100 { jitters.remove(0); }
+
+        let buffers = self.mask_buffer_pct.entry(mask_id.to_string()).or_default();
+        buffers.push(buffer_pct);
+        if buffers.len() > 100 { buffers.remove(0); }
     }
 
-    pub fn is_anomalous(&self, mask_id: &str) -> bool {
+    pub fn is_anomalous(
+        &self,
+        mask_id: &str,
+        anomalous_jitter_ms: f64,
+        anomalous_buffer_pct: u8,
+    ) -> bool {
         if let Some(losses) = self.mask_packet_loss.get(mask_id) {
             if losses.len() >= 10 {
                 let avg = losses.iter().sum::<f64>() / losses.len() as f64;
@@ -340,7 +385,36 @@ impl AnomalyDetector {
                 if avg > self.baseline_rtt * 3.0 { return true; }
             }
         }
+        if let Some(jitters) = self.mask_jitter.get(mask_id) {
+            if jitters.len() >= 10 {
+                let avg = jitters.iter().sum::<f64>() / jitters.len() as f64;
+                if avg >= anomalous_jitter_ms { return true; }
+            }
+        }
+        if let Some(buffers) = self.mask_buffer_pct.get(mask_id) {
+            if buffers.len() >= 10 {
+                let avg = buffers.iter().map(|&v| v as f64).sum::<f64>() / buffers.len() as f64;
+                if avg >= anomalous_buffer_pct as f64 { return true; }
+            }
+        }
         false
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DecisionState {
+    warning_streak: usize,
+    compromised_streak: usize,
+    last_rotation_at: Option<Instant>,
+}
+
+impl Default for DecisionState {
+    fn default() -> Self {
+        Self {
+            warning_streak: 0,
+            compromised_streak: 0,
+            last_rotation_at: None,
+        }
     }
 }
 
@@ -362,6 +436,9 @@ pub struct NeuralResonanceModule {
 
     /// Anomaly detection state
     anomaly_detector: AnomalyDetector,
+
+    /// Per-session resonance decision state for hysteresis/cooldown.
+    decision_state: dashmap::DashMap<[u8; 16], DecisionState>,
 
     /// Whether the module is loaded
     loaded: bool,
@@ -402,6 +479,7 @@ impl NeuralResonanceModule {
             encoders: HashMap::new(),
             session_stats: dashmap::DashMap::new(),
             anomaly_detector: AnomalyDetector::new(),
+            decision_state: dashmap::DashMap::new(),
             loaded: false,
         })
     }
@@ -459,7 +537,7 @@ impl NeuralResonanceModule {
     /// Encodes live traffic into a 64-dim feature vector, passes it through
     /// the mask's baked encoder, and computes reconstruction MSE.
     pub fn check_resonance(
-        &self,
+        &mut self,
         session_id: [u8; 16],
         mask_id: &str,
     ) -> Result<ResonanceResult, String> {
@@ -485,27 +563,94 @@ impl NeuralResonanceModule {
         let features = encode_features(&stats);
         let mse = encoder.reconstruction_error(&features);
 
-        let status = if mse > self.config.compromised_threshold {
-            ResonanceStatus::Compromised
+        let now = Instant::now();
+        let mut state = self
+            .decision_state
+            .entry(session_id)
+            .or_insert_with(DecisionState::default);
+
+        if mse > self.config.compromised_threshold {
+            state.compromised_streak = state.compromised_streak.saturating_add(1);
+            state.warning_streak = state.warning_streak.saturating_add(1);
         } else if mse > self.config.warning_threshold {
-            ResonanceStatus::Warning
+            state.warning_streak = state.warning_streak.saturating_add(1);
+            state.compromised_streak = 0;
         } else {
-            ResonanceStatus::Healthy
+            state.warning_streak = 0;
+            state.compromised_streak = 0;
+        }
+
+        let in_cooldown = state
+            .last_rotation_at
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(self.config.rotation_cooldown_secs));
+
+        let (status, message) = if in_cooldown {
+            (
+                ResonanceStatus::Warning,
+                Some(format!(
+                    "rotation cooldown active; mse={:.4}, warning_streak={}, compromised_streak={}",
+                    mse, state.warning_streak, state.compromised_streak
+                )),
+            )
+        } else if state.compromised_streak >= self.config.compromised_streak_required {
+            (
+                ResonanceStatus::Compromised,
+                Some(format!(
+                    "compromised threshold exceeded for {} consecutive checks (mse={:.4})",
+                    state.compromised_streak, mse
+                )),
+            )
+        } else if state.warning_streak >= self.config.warning_streak_required || mse > self.config.warning_threshold {
+            (
+                ResonanceStatus::Warning,
+                Some(format!(
+                    "warning threshold exceeded; warning_streak={}, compromised_streak={}, mse={:.4}",
+                    state.warning_streak, state.compromised_streak, mse
+                )),
+            )
+        } else {
+            (
+                ResonanceStatus::Healthy,
+                Some(format!("healthy; mse={:.4}", mse)),
+            )
         };
 
-        Ok(ResonanceResult { mse, status, message: None })
+        Ok(ResonanceResult { mse, status, message })
     }
 
     /// Record telemetry for anomaly detection
-    pub fn record_telemetry(&mut self, mask_id: &str, packet_loss: f64, rtt_ms: f64) {
+    pub fn record_telemetry(
+        &mut self,
+        mask_id: &str,
+        packet_loss: f64,
+        rtt_ms: f64,
+        jitter_ms: f64,
+        buffer_pct: u8,
+    ) {
         if self.config.enable_anomaly_detection {
-            self.anomaly_detector.record_metrics(mask_id, packet_loss, rtt_ms);
+            self.anomaly_detector
+                .record_metrics(mask_id, packet_loss, rtt_ms, jitter_ms, buffer_pct);
         }
     }
 
     /// Check if mask is anomalous (possible DPI blocking)
     pub fn is_mask_anomalous(&self, mask_id: &str) -> bool {
-        self.anomaly_detector.is_anomalous(mask_id)
+        self.anomaly_detector.is_anomalous(
+            mask_id,
+            self.config.anomalous_jitter_ms,
+            self.config.anomalous_buffer_pct,
+        )
+    }
+
+    /// Mark a successful rotation so subsequent checks honor cooldown.
+    pub fn note_rotation(&mut self, session_id: [u8; 16]) {
+        let mut state = self
+            .decision_state
+            .entry(session_id)
+            .or_insert_with(DecisionState::default);
+        state.warning_streak = 0;
+        state.compromised_streak = 0;
+        state.last_rotation_at = Some(Instant::now());
     }
 
     /// Get or create session stats
@@ -516,6 +661,7 @@ impl NeuralResonanceModule {
     /// Cleanup old session stats
     pub fn cleanup_stats(&self, session_id: [u8; 16]) {
         self.session_stats.remove(&session_id);
+        self.decision_state.remove(&session_id);
     }
 
     /// Total memory usage for all baked encoders

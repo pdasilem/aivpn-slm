@@ -9,7 +9,13 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::{POLY1305_TAG_SIZE, TAG_SIZE};
 use crate::error::{Error, Result};
 
-/// Maximum UDP packet size (optimized for VPN MTU 1420 + overhead)
+/// Conservative production TUN MTU for the Android <-> server path.
+///
+/// 1280 keeps the tunnel inside the IPv6 minimum path MTU budget and avoids
+/// relying on optimistic mobile-network MTU assumptions.
+pub const SAFE_TUN_MTU: u16 = 1280;
+
+/// Maximum UDP packet size (optimized for VPN MTU + overhead)
 pub const MAX_PACKET_SIZE: usize = 1500;
 
 /// Minimum header overhead (tag + pad_len + inner_header + poly1305)

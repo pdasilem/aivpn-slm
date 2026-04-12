@@ -5,6 +5,7 @@
 
 pub mod crypto;
 pub mod client_wire;
+pub mod fragment;
 pub mod protocol;
 pub mod mask;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod upload_pipeline;
 
 pub use crypto::*;
 pub use client_wire::*;
+pub use fragment::*;
 pub use protocol::*;
 pub use mask::*;
 pub use error::*;

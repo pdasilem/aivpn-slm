@@ -11,8 +11,9 @@ use tokio::io::AsyncWriteExt;
 use tracing::{info, debug};
 
 use aivpn_common::error::{Error, Result};
+use aivpn_common::protocol::SAFE_TUN_MTU;
 
-const TUN_MTU: u16 = 1420;
+const TUN_MTU: u16 = SAFE_TUN_MTU;
 
 /// NAT Forwarder for routing traffic to internet
 /// Uses split reader/writer to avoid mutex starvation

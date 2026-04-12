@@ -19,14 +19,16 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use aivpn_common::client_wire::{
-    build_inner_packet, build_zero_mdh_packet, decode_packet_with_mdh_len,
+    build_fragment_inner_packet, build_inner_packet, build_masked_packet, build_zero_mdh_packet,
+    decode_packet_with_mdh_len, mask_mdh_len, max_data_payload_len, max_fragment_payload_len,
     obfuscate_client_eph_pub, process_server_hello_with_mdh_len, RecvWindow, DEFAULT_ZERO_MDH,
 };
 use aivpn_common::crypto::{
     self, derive_session_keys, KeyPair, SessionKeys,
 };
 use aivpn_common::error::{Error, Result};
-use aivpn_common::mask::MaskProfile;
+use aivpn_common::fragment::{FragmentAssembler, FragmentHeader, FRAGMENT_HEADER_LEN};
+use aivpn_common::mask::{preset_masks::webrtc_zoom_v3, MaskProfile};
 use aivpn_common::protocol::{ControlPayload, InnerType};
 use aivpn_common::upload_pipeline::{self, PacketEncryptor, UploadConfig};
 
@@ -241,6 +243,7 @@ pub async fn run_tunnel_android(
     // ── 4. Send init handshake (Control/Keepalive + obfuscated eph_pub) ──
     let mut send_counter: u64 = 0;
     let mut send_seq: u16 = 0;
+    let current_mask = Arc::new(Mutex::new(webrtc_zoom_v3()));
     {
         let keepalive = ControlPayload::Keepalive.encode()?;
         let inner = build_inner_packet(InnerType::Control, send_seq, &keepalive);
@@ -340,12 +343,14 @@ pub async fn run_tunnel_android(
     let upload_state_for_sender = upload_state.clone();
     let telemetry_state_for_sender = telemetry_state.clone();
     let session_for_upload = session.clone();
+    let current_mask_for_sender = current_mask.clone();
     let upload_sender_task = tokio::spawn(async move {
-        // Wrap zero-MDH encryption with UPLOAD_BYTES tracking.
+        // Android now uses the session's active mask profile for post-handshake traffic.
         struct AndroidEncryptor {
             upload_state: Arc<Mutex<AndroidCryptoState>>,
             session: Arc<SessionRuntime>,
             telemetry_state: Arc<Mutex<TelemetryState>>,
+            current_mask: Arc<Mutex<MaskProfile>>,
         }
 
         impl PacketEncryptor for AndroidEncryptor {
@@ -354,7 +359,40 @@ pub async fn run_tunnel_android(
                 let inner = build_inner_packet(InnerType::Data, state.seq, payload);
                 state.seq = state.seq.wrapping_add(1);
                 let keys = state.keys.clone();
-                build_zero_mdh_packet(&keys, &mut state.counter, &inner, None)
+                let mask = self.current_mask.lock().expect("android mask poisoned").clone();
+                build_masked_packet(&keys, &mut state.counter, &inner, Some(&mask), None)
+            }
+            fn encrypt_data_many(&mut self, payload: &[u8]) -> aivpn_common::error::Result<Vec<Vec<u8>>> {
+                let mut state = self.upload_state.lock().expect("android upload state poisoned");
+                let keys = state.keys.clone();
+                let mask = self.current_mask.lock().expect("android mask poisoned").clone();
+                let direct_limit = max_data_payload_len(Some(&mask));
+                if payload.len() <= direct_limit {
+                    let inner = build_inner_packet(InnerType::Data, state.seq, payload);
+                    state.seq = state.seq.wrapping_add(1);
+                    return build_masked_packet(&keys, &mut state.counter, &inner, Some(&mask), None)
+                        .map(|packet| vec![packet]);
+                }
+
+                let fragment_limit = max_fragment_payload_len(Some(&mask)).max(1);
+                let fragment_count = payload.len().div_ceil(fragment_limit);
+                if fragment_count > u16::MAX as usize {
+                    return Err(Error::InvalidPacket("Payload requires too many fragments"));
+                }
+
+                let fragment_id = state.seq as u32;
+                let mut packets = Vec::with_capacity(fragment_count);
+                for (index, chunk) in payload.chunks(fragment_limit).enumerate() {
+                    let header = FragmentHeader {
+                        fragment_id,
+                        fragment_index: index as u16,
+                        fragment_count: fragment_count as u16,
+                    };
+                    let inner = build_fragment_inner_packet(state.seq, header, chunk);
+                    state.seq = state.seq.wrapping_add(1);
+                    packets.push(build_masked_packet(&keys, &mut state.counter, &inner, Some(&mask), None)?);
+                }
+                Ok(packets)
             }
             fn encrypt_keepalive(&mut self) -> aivpn_common::error::Result<Vec<u8>> {
                 self.telemetry_state
@@ -369,7 +407,8 @@ pub async fn run_tunnel_android(
                 let inner = build_inner_packet(InnerType::Control, state.seq, &encoded);
                 state.seq = state.seq.wrapping_add(1);
                 let keys = state.keys.clone();
-                build_zero_mdh_packet(&keys, &mut state.counter, &inner, None)
+                let mask = self.current_mask.lock().expect("android mask poisoned").clone();
+                build_masked_packet(&keys, &mut state.counter, &inner, Some(&mask), None)
             }
             fn on_data_sent(&mut self, payload_len: usize) {
                 self.session
@@ -385,6 +424,7 @@ pub async fn run_tunnel_android(
             upload_state: upload_state_for_sender,
             session: session_for_upload,
             telemetry_state: telemetry_state_for_sender,
+            current_mask: current_mask_for_sender,
         };
         let config = UploadConfig {
             keepalive_interval: KEEPALIVE_INTERVAL,
@@ -399,6 +439,7 @@ pub async fn run_tunnel_android(
     rekey_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     rekey_tick.tick().await;
     let mut pending_ratchet_keypair: Option<KeyPair> = None;
+    let mut fragment_assembler = FragmentAssembler::default();
 
     // Periodic check for RX silence — uses a proper Interval so it's not
     // recreated every select! iteration (which would reset the timer).
@@ -433,11 +474,15 @@ pub async fn run_tunnel_android(
                 let n = r?;
                 last_rx = Instant::now();
                 upload_at_last_rx = session.upload_bytes.load(Ordering::Relaxed);
+                let current_mdh_len = {
+                    let mask = current_mask.lock().expect("android mask poisoned");
+                    mask_mdh_len(Some(&mask))
+                };
                 let decoded = match decode_packet_with_mdh_len(
                     &udp_buf[..n],
                     &keys,
                     &mut recv_win,
-                    DEFAULT_ZERO_MDH.len(),
+                    current_mdh_len,
                 ) {
                     Ok(decoded) => {
                         if transition_recv_keys.take().is_some() {
@@ -452,7 +497,7 @@ pub async fn run_tunnel_android(
                                 &udp_buf[..n],
                                 previous_keys,
                                 &mut transition_recv_win,
-                                DEFAULT_ZERO_MDH.len(),
+                                current_mdh_len,
                             ).ok()
                         } else {
                             None
@@ -466,6 +511,15 @@ pub async fn run_tunnel_android(
                         session
                             .download_bytes
                             .fetch_add(decoded.payload.len() as u64, Ordering::Relaxed);
+                    } else if decoded.header.inner_type == InnerType::Fragment {
+                        let header = FragmentHeader::decode(&decoded.payload)?;
+                        let fragment_payload = &decoded.payload[FRAGMENT_HEADER_LEN..];
+                        if let Some(reassembled) = fragment_assembler.push(header, fragment_payload)? {
+                            tun_async_write(&tun, &reassembled).await?;
+                            session
+                                .download_bytes
+                                .fetch_add(reassembled.len() as u64, Ordering::Relaxed);
+                        }
                     } else if decoded.header.inner_type == InnerType::Control {
                         match ControlPayload::decode(&decoded.payload)? {
                             ControlPayload::MaskUpdate { mask_data, signature } => {
@@ -476,14 +530,12 @@ pub async fn run_tunnel_android(
                                 )?;
                                 let new_mask: MaskProfile = rmp_serde::from_slice(&mask_data)
                                     .map_err(|e| Error::Serialization(format!("Invalid MaskUpdate payload: {e}")))?;
-                                if new_mask.header_template.as_slice() == DEFAULT_ZERO_MDH {
-                                    log::info!("aivpn: zero-MDH MaskUpdate verified for {}", new_mask.mask_id);
-                                } else {
-                                    log::warn!(
-                                        "aivpn: verified MaskUpdate for {} but advanced masks are not applied on Android zero-MDH client yet",
-                                        new_mask.mask_id
-                                    );
-                                }
+                                new_mask
+                                    .validate_android_runtime_contract()
+                                    .map_err(|e| Error::Session(format!("Unsupported MaskUpdate profile: {e}")))?;
+                                let new_mask_id = new_mask.mask_id.clone();
+                                *current_mask.lock().expect("android mask poisoned") = new_mask;
+                                log::info!("aivpn: applied MaskUpdate for {}", new_mask_id);
                             }
                             ControlPayload::ServerHello { server_eph_pub, signature } => {
                                 let ratchet_keypair = pending_ratchet_keypair

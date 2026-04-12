@@ -1,4 +1,4 @@
-use rand::RngCore;
+use rand::{Rng, RngCore};
 
 use crate::crypto::{
     self, current_timestamp_ms, compute_time_window, decrypt_payload, derive_session_keys,
@@ -6,7 +6,9 @@ use crate::crypto::{
     NONCE_SIZE, TAG_SIZE,
 };
 use crate::error::{Error, Result};
-use crate::protocol::{ControlPayload, InnerHeader, InnerType};
+use crate::fragment::FragmentHeader;
+use crate::mask::{MaskProfile, PaddingStrategy};
+use crate::protocol::{ControlPayload, InnerHeader, InnerType, MAX_PACKET_SIZE};
 
 pub const DEFAULT_ZERO_MDH: [u8; 4] = [0u8; 4];
 
@@ -123,12 +125,28 @@ pub fn build_zero_mdh_packet(
     inner: &[u8],
     obfuscated_eph_pub: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>> {
-    let pad_len: u16 = 8 + rand::thread_rng().next_u32() as u16 % 16;
+    build_masked_packet(keys, counter, inner, None, obfuscated_eph_pub)
+}
+
+pub fn build_masked_packet(
+    keys: &SessionKeys,
+    counter: &mut u64,
+    inner: &[u8],
+    mask: Option<&MaskProfile>,
+    obfuscated_eph_pub: Option<&[u8; 32]>,
+) -> Result<Vec<u8>> {
+    let mut rng = rand::thread_rng();
+    let mdh = build_mask_header(mask, obfuscated_eph_pub)?;
+    let pad_len = match mask {
+        Some(mask) => sample_mask_padding(mask, inner.len(), mdh.len(), &mut rng),
+        None => 8 + rng.next_u32() as u16 % 16,
+    };
+
     let mut plaintext = Vec::with_capacity(2 + inner.len() + pad_len as usize);
     plaintext.extend_from_slice(&pad_len.to_le_bytes());
     plaintext.extend_from_slice(inner);
     plaintext.resize(2 + inner.len() + pad_len as usize, 0);
-    rand::thread_rng().fill_bytes(&mut plaintext[2 + inner.len()..]);
+    rng.fill_bytes(&mut plaintext[2 + inner.len()..]);
 
     let current_counter = *counter;
     *counter += 1;
@@ -138,16 +156,90 @@ pub fn build_zero_mdh_packet(
     let time_window = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
     let tag = generate_resonance_tag(&keys.tag_secret, current_counter, time_window);
 
-    let eph_len = if obfuscated_eph_pub.is_some() { 32 } else { 0 };
-    let mut packet = Vec::with_capacity(TAG_SIZE + DEFAULT_ZERO_MDH.len() + eph_len + ciphertext.len());
+    let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
     packet.extend_from_slice(&tag);
-    packet.extend_from_slice(&DEFAULT_ZERO_MDH);
-    if let Some(eph) = obfuscated_eph_pub {
-        packet.extend_from_slice(eph);
-    }
+    packet.extend_from_slice(&mdh);
     packet.extend_from_slice(&ciphertext);
 
     Ok(packet)
+}
+
+pub fn mask_mdh_len(mask: Option<&MaskProfile>) -> usize {
+    mask.map(|m| m.header_template.len())
+        .unwrap_or(DEFAULT_ZERO_MDH.len())
+}
+
+fn build_mask_header(
+    mask: Option<&MaskProfile>,
+    obfuscated_eph_pub: Option<&[u8; 32]>,
+) -> Result<Vec<u8>> {
+    match mask {
+        Some(mask) => {
+            let mut mdh = mask.header_template.clone();
+            if let Some(eph) = obfuscated_eph_pub {
+                let eph_offset = mask.eph_pub_offset as usize;
+                let eph_len = mask.eph_pub_length as usize;
+                if eph_len != eph.len() {
+                    return Err(Error::InvalidPacket("Mask eph_pub_length must be 32 bytes"));
+                }
+                if mdh.len() < eph_offset + eph_len {
+                    mdh.resize(eph_offset + eph_len, 0);
+                }
+                mdh[eph_offset..eph_offset + eph_len].copy_from_slice(eph);
+            }
+            Ok(mdh)
+        }
+        None => {
+            let eph_len = if obfuscated_eph_pub.is_some() { 32 } else { 0 };
+            let mut mdh = Vec::with_capacity(DEFAULT_ZERO_MDH.len() + eph_len);
+            mdh.extend_from_slice(&DEFAULT_ZERO_MDH);
+            if let Some(eph) = obfuscated_eph_pub {
+                mdh.extend_from_slice(eph);
+            }
+            Ok(mdh)
+        }
+    }
+}
+
+fn sample_mask_padding(
+    mask: &MaskProfile,
+    inner_len: usize,
+    mdh_len: usize,
+    rng: &mut rand::rngs::ThreadRng,
+) -> u16 {
+    let target_wire = (mask.size_distribution.sample(rng) as usize).min(MAX_PACKET_SIZE);
+    let payload_size = 2 + inner_len;
+    let target_plaintext = target_wire.saturating_sub(TAG_SIZE + mdh_len + 16);
+    match &mask.padding_strategy {
+        PaddingStrategy::RandomUniform { min, max } => rng.gen_range(*min..=*max),
+        PaddingStrategy::MatchDistribution | PaddingStrategy::Fixed { .. } => mask
+            .padding_strategy
+            .calc_padding(payload_size, target_plaintext.min(u16::MAX as usize) as u16, rng),
+    }
+}
+
+pub fn max_data_payload_len(mask: Option<&MaskProfile>) -> usize {
+    let mdh_len = mask_mdh_len(mask);
+    let max_plaintext = MAX_PACKET_SIZE
+        .saturating_sub(TAG_SIZE + mdh_len + 16);
+    max_plaintext.saturating_sub(2 + 4)
+}
+
+pub fn max_fragment_payload_len(mask: Option<&MaskProfile>) -> usize {
+    let mdh_len = mask_mdh_len(mask);
+    let max_plaintext = MAX_PACKET_SIZE
+        .saturating_sub(TAG_SIZE + mdh_len + 16);
+    max_plaintext.saturating_sub(2 + 4 + crate::fragment::FRAGMENT_HEADER_LEN)
+}
+
+pub fn build_fragment_inner_packet(
+    seq_num: u16,
+    header: FragmentHeader,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut inner = build_inner_packet(InnerType::Fragment, seq_num, &header.encode());
+    inner.extend_from_slice(payload);
+    inner
 }
 
 pub fn decode_packet_with_mdh_len(

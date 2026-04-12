@@ -7,6 +7,7 @@ use rand::{Rng, distributions::Distribution};
 use rand::distributions::weighted::WeightedIndex;
 
 use crate::error::{Error, Result};
+use crate::protocol::MAX_PACKET_SIZE;
 
 /// Mask profile for traffic mimicry
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +241,75 @@ pub enum TransitionCondition {
 }
 
 impl MaskProfile {
+    /// Runtime contract implemented by the current Android<->server path.
+    ///
+    /// This is intentionally strict. Profiles outside this contract must not be
+    /// selected for production Android sessions.
+    pub fn validate_android_runtime_contract(&self) -> Result<()> {
+        if self.eph_pub_length != 32 {
+            return Err(Error::Mask(format!(
+                "mask {} has unsupported eph_pub_length {}",
+                self.mask_id, self.eph_pub_length
+            )));
+        }
+
+        let eph_offset = self.eph_pub_offset as usize;
+        if eph_offset > MAX_PACKET_SIZE {
+            return Err(Error::Mask(format!(
+                "mask {} has absurd eph_pub_offset {}",
+                self.mask_id, self.eph_pub_offset
+            )));
+        }
+
+        if self.reverse_profile.is_some() {
+            return Err(Error::Mask(format!(
+                "mask {} reverse_profile is not supported in Android runtime",
+                self.mask_id
+            )));
+        }
+
+        if self.signature_vector.len() != 64 {
+            return Err(Error::Mask(format!(
+                "mask {} has invalid signature_vector length {}",
+                self.mask_id,
+                self.signature_vector.len()
+            )));
+        }
+
+        if self.fsm_states.is_empty() {
+            return Err(Error::Mask(format!(
+                "mask {} has no FSM states",
+                self.mask_id
+            )));
+        }
+
+        if !self.fsm_states.iter().any(|state| state.state_id == self.fsm_initial_state) {
+            return Err(Error::Mask(format!(
+                "mask {} initial FSM state {} is missing",
+                self.mask_id, self.fsm_initial_state
+            )));
+        }
+
+        for transition in self
+            .fsm_states
+            .iter()
+            .flat_map(|state| state.transitions.iter())
+        {
+            if let TransitionCondition::OnPayloadType(_) = transition.condition {
+                return Err(Error::Mask(format!(
+                    "mask {} uses unsupported OnPayloadType transition",
+                    self.mask_id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn is_android_runtime_compatible(&self) -> bool {
+        self.validate_android_runtime_contract().is_ok()
+    }
+
     /// Build a deterministic 64-dim fingerprint from the profile itself.
     ///
     /// This is not a trained model output. It is a stable structural signature
@@ -564,6 +634,7 @@ pub mod preset_masks {
 #[cfg(test)]
 mod tests {
     use super::preset_masks::{quic_https_v2, webrtc_zoom_v3};
+    use super::{FSMState, FSMTransition, TransitionCondition};
 
     #[test]
     fn preset_masks_have_derived_nonzero_signatures() {
@@ -575,5 +646,27 @@ mod tests {
         assert!(webrtc.signature_vector.iter().any(|v| *v != 0.0));
         assert!(quic.signature_vector.iter().any(|v| *v != 0.0));
         assert_ne!(webrtc.signature_vector, quic.signature_vector);
+    }
+
+    #[test]
+    fn preset_masks_are_android_runtime_compatible() {
+        assert!(webrtc_zoom_v3().is_android_runtime_compatible());
+        assert!(quic_https_v2().is_android_runtime_compatible());
+    }
+
+    #[test]
+    fn rejects_unsupported_on_payload_type_transition() {
+        let mut mask = webrtc_zoom_v3();
+        mask.fsm_states = vec![FSMState {
+            state_id: 0,
+            transitions: vec![FSMTransition {
+                condition: TransitionCondition::OnPayloadType(7),
+                next_state: 1,
+                size_override: None,
+                iat_override: None,
+                padding_override: None,
+            }],
+        }];
+        assert!(mask.validate_android_runtime_contract().is_err());
     }
 }

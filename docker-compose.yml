@@ -38,7 +38,7 @@ services:
         max-file: "5"
     labels:
       - "com.aivpn.service=gateway"
-      - "com.aivpn.version=0.2.8"
+      - "com.aivpn.version=0.2.12"
     healthcheck:
       test: ["CMD-SHELL", "test \"$(basename \"$(readlink /proc/1/exe 2>/dev/null)\")\" = \"aivpn-server\" || exit 1"]
       interval: 30s
@@ -79,7 +79,7 @@ services:
       - "${AIVPN_ACCESS_HOST:-127.0.0.1}:27449:27449"
     labels:
       - "com.aivpn.service=admin-web"
-      - "com.aivpn.version=0.2.8"
+      - "com.aivpn.version=0.2.12"
     healthcheck:
       test: ["CMD-SHELL", "printf 'GET / HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' | nc 127.0.0.1 27449 | grep -q '200 OK'"]
       interval: 30s

@@ -34,7 +34,7 @@ class AivpnService : VpnService() {
         const val ACTION_DISCONNECT = "com.aivpn.DISCONNECT"
         private const val CHANNEL_ID      = "aivpn_vpn"
         private const val NOTIFICATION_ID = 1
-        private const val TUN_MTU         = 1420
+        private const val TUN_MTU         = 1280
         private const val INITIAL_RETRY_DELAY_MS = 500L
         private const val MAX_RETRY_DELAY_MS     = 8_000L
         private const val TAG = "AivpnService"

@@ -16,10 +16,12 @@ use tokio::net::UdpSocket;
 use tokio::io::AsyncReadExt;
 use tracing::{info, warn, error, debug};
 
-use aivpn_common::crypto::{
-    self, encrypt_payload, decrypt_payload,
-    TAG_SIZE, NONCE_SIZE,
+use aivpn_common::crypto::{self, decrypt_payload, TAG_SIZE, NONCE_SIZE};
+use aivpn_common::client_wire::{
+    build_fragment_inner_packet, build_masked_packet, mask_mdh_len, max_data_payload_len,
+    max_fragment_payload_len,
 };
+use aivpn_common::fragment::{FragmentAssembler, FragmentHeader, FRAGMENT_HEADER_LEN};
 use aivpn_common::protocol::{
     InnerType, InnerHeader, ControlPayload, ControlSubtype,
     MAX_PACKET_SIZE,
@@ -109,17 +111,60 @@ impl MaskCatalog {
         self.masks.remove(mask_id);
     }
 
-    /// Select the best non-compromised mask, excluding `current_mask_id`
+    fn android_runtime_pool(&self) -> Vec<MaskProfile> {
+        self.masks
+            .iter()
+            .filter(|entry| entry.value().is_android_runtime_compatible())
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Select a non-compromised replacement mask that is explicitly compatible
+    /// with the Android runtime contract implemented today.
     pub fn select_replacement(&self, current_mask_id: &str) -> Option<MaskProfile> {
-        self.masks.iter()
-            .filter(|e| e.key() != current_mask_id)
-            .map(|e| e.value().clone())
-            .next()
+        let mut candidates = self
+            .android_runtime_pool()
+            .into_iter()
+            .filter(|mask| mask.mask_id != current_mask_id)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| a.mask_id.cmp(&b.mask_id));
+        candidates.into_iter().next()
     }
 
     /// Get mask count
     pub fn available_count(&self) -> usize {
         self.masks.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MaskCatalog;
+    use aivpn_common::mask::preset_masks::{quic_https_v2, webrtc_zoom_v3};
+
+    #[test]
+    fn replacement_policy_stays_in_android_runtime_pool() {
+        let catalog = MaskCatalog::new();
+        let replacement = catalog
+            .select_replacement("webrtc_zoom_v3")
+            .expect("replacement");
+        assert!(replacement.is_android_runtime_compatible());
+        assert_eq!(replacement.mask_id, "quic_https_v2");
+    }
+
+    #[test]
+    fn incompatible_masks_are_never_selected() {
+        let catalog = MaskCatalog::new();
+        let mut incompatible = quic_https_v2();
+        incompatible.mask_id = "broken_mask".to_string();
+        incompatible.reverse_profile = Some(Box::new(webrtc_zoom_v3()));
+        catalog.register_mask(incompatible);
+
+        let replacement = catalog
+            .select_replacement("quic_https_v2")
+            .expect("replacement");
+        assert_ne!(replacement.mask_id, "broken_mask");
+        assert!(replacement.is_android_runtime_compatible());
     }
 }
 
@@ -145,6 +190,8 @@ pub struct Gateway {
     metrics: Arc<MetricsCollector>,
     /// Client database for PSK-based authentication
     client_db: Option<Arc<ClientDatabase>>,
+    /// Per-session fragment reassembly state for client->server fragmented data.
+    fragment_assemblers: DashMap<[u8; 16], parking_lot::Mutex<FragmentAssembler>>,
 }
 
 impl Gateway {
@@ -202,6 +249,7 @@ impl Gateway {
             mask_catalog,
             metrics: Arc::new(MetricsCollector::new()),
             client_db: config.client_db,
+            fragment_assemblers: DashMap::new(),
         })
     }
     
@@ -279,7 +327,6 @@ impl Gateway {
                 let sessions = self.session_manager.clone();
                 let socket = self.udp_socket.as_ref().unwrap().clone();
                 let metrics = self.metrics.clone();
-                let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
                 let tun_addr = self.config.tun_addr.clone();
                 
                 // Channel for ICMP replies to be written to TUN
@@ -296,7 +343,7 @@ impl Gateway {
                 });
                 
                 tokio::spawn(async move {
-                    Self::tun_read_loop(tun_reader, icmp_tx, sessions, socket, metrics, mask, tun_addr).await;
+                    Self::tun_read_loop(tun_reader, icmp_tx, sessions, socket, metrics, tun_addr).await;
                 });
                 info!("TUN read loop spawned");
             }
@@ -382,7 +429,7 @@ impl Gateway {
             
             let mut mask_updates = Vec::new();
             {
-                let neural_guard = neural.lock();
+                let mut neural_guard = neural.lock();
             
                 for (session_id, mask_id) in &session_checks {
                 // Check neural resonance (Patent 1: Signal Reconstruction Resonance)
@@ -405,8 +452,10 @@ impl Gateway {
                         match result.status {
                             ResonanceStatus::Compromised => {
                                 warn!(
-                                    "Mask '{}' compromised (MSE={:.4}) — triggering rotation (Patent 3)",
-                                    mask_id, result.mse
+                                    "Mask '{}' compromised (MSE={:.4}) — {}",
+                                    mask_id,
+                                    result.mse,
+                                    result.message.as_deref().unwrap_or("triggering rotation")
                                 );
                                 
                                 // Mark mask as compromised in catalog
@@ -427,12 +476,19 @@ impl Gateway {
                             }
                             ResonanceStatus::Warning => {
                                 debug!(
-                                    "Mask '{}' warning (MSE={:.4}) — monitoring",
-                                    mask_id, result.mse
+                                    "Mask '{}' warning (MSE={:.4}) — {}",
+                                    mask_id,
+                                    result.mse,
+                                    result.message.as_deref().unwrap_or("monitoring")
                                 );
                             }
                             ResonanceStatus::Healthy => {
-                                // All good
+                                debug!(
+                                    "Mask '{}' healthy (MSE={:.4}) — {}",
+                                    mask_id,
+                                    result.mse,
+                                    result.message.as_deref().unwrap_or("healthy")
+                                );
                             }
                             ResonanceStatus::Skip => {
                                 // Not enough data or model not loaded
@@ -476,6 +532,7 @@ impl Gateway {
                             .get_session(&session_id)
                             .and_then(|session| session.lock().client_id.clone());
                         sessions.update_session_mask(&session_id, new_mask);
+                        neural.lock().note_rotation(session_id);
                         metrics.record_mask_rotation();
                         if let Some(client_id) = client_id {
                             metrics.record_client_mask_rotation(&client_id);
@@ -536,7 +593,6 @@ impl Gateway {
         sessions: Arc<SessionManager>,
         socket: Arc<UdpSocket>,
         metrics: Arc<MetricsCollector>,
-        mask: MaskProfile,
         tun_addr: String,
     ) {
         let mut buf = vec![0u8; MAX_PACKET_SIZE];
@@ -572,72 +628,80 @@ impl Gateway {
                         }
                     };
                     
-                    // Build encrypted response packet
-                    // Minimize lock duration: extract only what we need under lock, then encrypt outside
-                    let (client_addr, client_id, tag, mdh, ciphertext) = {
+                    // Build encrypted response packet using the session's active mask.
+                    let (client_addr, client_id, packets) = {
                         let mut sess = session.lock();
                         let client_addr = sess.client_addr;
                         let client_id = sess.client_id.clone();
-                        let seq_num = sess.next_seq() as u16;
-                        let (nonce, counter) = sess.next_send_nonce();
-                        let key = sess.keys.session_key.clone();
-                        let tag_secret = sess.keys.tag_secret;
-                        drop(sess); // Release lock BEFORE expensive encryption
-                        
-                        // Build inner payload: Data type + IP packet
-                        let inner_header = InnerHeader {
-                            inner_type: InnerType::Data,
-                            seq_num,
-                        };
-                        let mut inner_payload = inner_header.encode().to_vec();
-                        inner_payload.extend_from_slice(packet);
-                        
-                        // Build MDH (no eph_pub for data packets)
-                        let mdh = mask.header_template.clone();
-                        
-                        // Pad and encrypt (outside lock)
-                        let pad_len: u16 = 0;
-                        let mut padded = Vec::with_capacity(2 + inner_payload.len());
-                        padded.extend_from_slice(&pad_len.to_le_bytes());
-                        padded.extend_from_slice(&inner_payload);
-                        
-                        let ciphertext = match encrypt_payload(&key, &nonce, &padded) {
-                            Ok(ct) => ct,
-                            Err(e) => {
-                                debug!("TUN: encrypt error: {}", e);
+                        let keys = sess.keys.clone();
+                        let mask = sess.mask.clone();
+                        let mut send_counter = sess.send_counter;
+                        let direct_limit = max_data_payload_len(mask.as_ref());
+                        let packets = if packet.len() <= direct_limit {
+                            let seq_num = sess.next_seq() as u16;
+                            let inner_header = InnerHeader {
+                                inner_type: InnerType::Data,
+                                seq_num,
+                            };
+                            let mut inner_payload = inner_header.encode().to_vec();
+                            inner_payload.extend_from_slice(packet);
+                            match build_masked_packet(&keys, &mut send_counter, &inner_payload, mask.as_ref(), None) {
+                                Ok(packet) => vec![packet],
+                                Err(e) => {
+                                    debug!("TUN: encrypt error: {}", e);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            let fragment_limit = max_fragment_payload_len(mask.as_ref()).max(1);
+                            let fragment_count = packet.len().div_ceil(fragment_limit);
+                            if fragment_count > u16::MAX as usize {
+                                debug!("TUN: packet too large to fragment safely");
                                 continue;
                             }
+                            let fragment_id = sess.send_seq;
+                            let mut packets = Vec::with_capacity(fragment_count);
+                            for (index, chunk) in packet.chunks(fragment_limit).enumerate() {
+                                let seq_num = sess.next_seq() as u16;
+                                let header = FragmentHeader {
+                                    fragment_id,
+                                    fragment_index: index as u16,
+                                    fragment_count: fragment_count as u16,
+                                };
+                                let inner_payload = build_fragment_inner_packet(seq_num, header, chunk);
+                                match build_masked_packet(&keys, &mut send_counter, &inner_payload, mask.as_ref(), None) {
+                                    Ok(packet) => packets.push(packet),
+                                    Err(e) => {
+                                        debug!("TUN: fragment encrypt error: {}", e);
+                                        packets.clear();
+                                        break;
+                                    }
+                                }
+                            }
+                            if packets.is_empty() {
+                                continue;
+                            }
+                            packets
                         };
-                        
-                        // Generate tag (outside lock)
-                        let time_window = crypto::compute_time_window(
-                            crypto::current_timestamp_ms(),
-                            aivpn_common::crypto::DEFAULT_WINDOW_MS,
-                        );
-                        let tag = crypto::generate_resonance_tag(
-                            &tag_secret,
-                            counter,
-                            time_window,
-                        );
-                        
-                        (client_addr, client_id, tag, mdh, ciphertext)
+                        sess.send_counter = send_counter;
+
+                        (client_addr, client_id, packets)
                     };
-                    
-                    // Assemble: TAG | MDH | ciphertext
-                    let mut aivpn_packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
-                    aivpn_packet.extend_from_slice(&tag);
-                    aivpn_packet.extend_from_slice(&mdh);
-                    aivpn_packet.extend_from_slice(&ciphertext);
-                    
+
                     // Send to client
-                    match socket.send_to(&aivpn_packet, client_addr).await {
-                        Ok(sent) => {
-                            metrics.record_packet_sent(sent);
-                            if let Some(client_id) = client_id.as_deref() {
-                                metrics.record_client_packet_sent(client_id, sent);
+                    for packet in &packets {
+                        match socket.send_to(packet, client_addr).await {
+                            Ok(sent) => {
+                                metrics.record_packet_sent(sent);
+                                if let Some(client_id) = client_id.as_deref() {
+                                    metrics.record_client_packet_sent(client_id, sent);
+                                }
+                            }
+                            Err(e) => {
+                                debug!("TUN: send failed: {}", e);
+                                break;
                             }
                         }
-                        Err(e) => debug!("TUN: send failed: {}", e),
                     }
                 }
                 Err(e) => {
@@ -770,27 +834,38 @@ impl Gateway {
         tag.copy_from_slice(&packet_data[0..TAG_SIZE]);
         
         // O(1) tag validation - find session
-        let mdh_len = 4; // Default for MVP
         let mut is_new_session = false;
-        let (session, counter, is_ratcheted_tag) = if let Some(session) = self.session_manager.get_session_by_tag(&tag) {
+        let (session, counter, is_ratcheted_tag, mdh_len) = if let Some(session) = self.session_manager.get_session_by_tag(&tag) {
             // Existing session — validate tag
             let tag_validation_started = Instant::now();
-            let (counter, is_ratcheted) = {
+            let (counter, is_ratcheted, mdh_len) = {
                 let sess = session.lock();
-                sess.validate_tag(&tag)
-                    .ok_or(Error::InvalidPacket("Invalid tag"))?
+                let (counter, is_ratcheted) = sess
+                    .validate_tag(&tag)
+                    .ok_or(Error::InvalidPacket("Invalid tag"))?;
+                let mdh_len = mask_mdh_len(sess.mask.as_ref());
+                (counter, is_ratcheted, mdh_len)
             };
             self.metrics
                 .record_tag_validation_time(tag_validation_started.elapsed().as_secs_f64());
-            (session, counter, is_ratcheted)
+            (session, counter, is_ratcheted, mdh_len)
         } else if let Some((session, counter, is_ratcheted)) = self.session_manager.refresh_and_find_by_tag(&tag) {
             // Tag not in map — time window may have advanced. Refresh all sessions and retry.
             debug!("Tag matched after refresh (counter={}, ratcheted={})", counter, is_ratcheted);
-            (session, counter, is_ratcheted)
+            let mdh_len = {
+                let sess = session.lock();
+                mask_mdh_len(sess.mask.as_ref())
+            };
+            (session, counter, is_ratcheted, mdh_len)
         } else if let Some((session, counter, is_ratcheted)) = self.session_manager.recover_session_by_tag(&tag, &client_addr.ip()) {
             // Counter drift recovery — client counter was out of range but session keys match
-            (session, counter, is_ratcheted)
+            let mdh_len = {
+                let sess = session.lock();
+                mask_mdh_len(sess.mask.as_ref())
+            };
+            (session, counter, is_ratcheted, mdh_len)
         } else {
+            let mdh_len = 4;
             // No session found — try handshake
             // Try to establish a new one from eph_pub in MDH
             if packet_data.len() < TAG_SIZE + mdh_len + 32 {
@@ -919,7 +994,7 @@ impl Gateway {
             self.metrics.record_handshake_success();
             let session_count = self.session_manager.session_count();
             self.metrics.update_session_count(session_count, session_count);
-            (session, counter, is_ratcheted)
+            (session, counter, is_ratcheted, mdh_len)
         };
         
         // Parse packet — pad_len is inside encrypted area (CRIT-5 fix)
@@ -1099,7 +1174,32 @@ impl Gateway {
                 self.handle_control_message(payload, session, client_addr).await?;
             }
             InnerType::Fragment => {
-                return Err(Error::InvalidPacket("Fragment packets are not implemented"));
+                let header = FragmentHeader::decode(payload)?;
+                let fragment_payload = &payload[FRAGMENT_HEADER_LEN..];
+                let session_id = session.lock().session_id;
+                let reassembled = {
+                    let entry = self
+                        .fragment_assemblers
+                        .entry(session_id)
+                        .or_insert_with(|| parking_lot::Mutex::new(FragmentAssembler::default()));
+                    let mut assembler = entry.lock();
+                    assembler.push(header, fragment_payload)?
+                };
+                if let Some(reassembled) = reassembled {
+                    debug!(
+                        "Reassembled fragmented data packet from {} ({} bytes)",
+                        hash_addr(&client_addr),
+                        reassembled.len()
+                    );
+                    if let Some(ref nat) = self.nat_forwarder {
+                        if let Err(err) = nat.forward_packet(&reassembled).await {
+                            self.metrics.record_nat_forward_failure();
+                            return Err(err);
+                        }
+                    } else {
+                        debug!("NAT disabled, dropping reassembled packet");
+                    }
+                }
             }
             InnerType::Ack => {
                 // Handle ACK
@@ -1170,7 +1270,13 @@ impl Gateway {
                 };
                 self.neural_module
                     .lock()
-                    .record_telemetry(&mask_id, packet_loss as f64 / 10_000.0, rtt_ms as f64);
+                    .record_telemetry(
+                        &mask_id,
+                        packet_loss as f64 / 10_000.0,
+                        rtt_ms as f64,
+                        jitter_ms as f64,
+                        buffer_pct,
+                    );
                 self.metrics.record_telemetry_response(
                     packet_loss as f64 / 10_000.0,
                     rtt_ms,
@@ -1293,45 +1399,12 @@ impl Gateway {
         session: &Arc<parking_lot::Mutex<Session>>,
     ) -> Result<Vec<u8>> {
         let mut sess = session.lock();
-        
-        // Use unified counter for both nonce and tag
-        let (nonce, counter) = sess.next_send_nonce();
-        info!("build_packet: counter={}, is_ratcheted={}", counter, sess.is_ratcheted);
-        
-        // Build padded plaintext: pad_len(u16) || plaintext || random_padding
-        // pad_len is inside encryption — invisible to DPI (CRIT-5 fix)
-        let pad_len = 16u16;
-        let mut padded = Vec::with_capacity(2 + plaintext.len() + pad_len as usize);
-        padded.extend_from_slice(&pad_len.to_le_bytes());
-        padded.extend_from_slice(plaintext);
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        for _ in 0..pad_len {
-            padded.push(rng.gen::<u8>());
-        }
-        
-        let ciphertext = encrypt_payload(&sess.keys.session_key, &nonce, &padded)?;
-        
-        // Generate tag
-        let time_window = crypto::compute_time_window(
-            crypto::current_timestamp_ms(),
-            aivpn_common::crypto::DEFAULT_WINDOW_MS,
-        );
-        let tag = crypto::generate_resonance_tag(
-            &sess.keys.tag_secret,
-            counter,
-            time_window,
-        );
-        
-        // Build MDH (simple for MVP)
-        let mdh = vec![0u8; 4];
-        
-        // Assemble packet: TAG | MDH | ciphertext (no cleartext padding)
-        let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
-        packet.extend_from_slice(&tag);
-        packet.extend_from_slice(&mdh);
-        packet.extend_from_slice(&ciphertext);
-        
+        info!("build_packet: send_counter={}, is_ratcheted={}", sess.send_counter, sess.is_ratcheted);
+        let keys = sess.keys.clone();
+        let mask = sess.mask.clone();
+        let mut send_counter = sess.send_counter;
+        let packet = build_masked_packet(&keys, &mut send_counter, plaintext, mask.as_ref(), None)?;
+        sess.send_counter = send_counter;
         Ok(packet)
     }
     

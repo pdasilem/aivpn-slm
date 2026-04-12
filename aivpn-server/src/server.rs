@@ -107,7 +107,8 @@ mod tests {
 
     #[test]
     fn test_server_creation() {
-        let config = GatewayConfig::default();
+        let mut config = GatewayConfig::default();
+        config.server_private_key = [0x11; 32];
         let server = AivpnServer::new(config);
         assert!(server.is_ok());
     }

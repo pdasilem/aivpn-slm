@@ -362,13 +362,15 @@ pub struct SessionManager {
     server_keys: KeyPair,
     /// Server's signing key (Ed25519)
     signing_key: ed25519_dalek::SigningKey,
+    /// Default mask assigned to newly established sessions.
+    default_mask: MaskProfile,
 }
 
 impl SessionManager {
     pub fn new(
         server_keys: KeyPair,
         signing_key: ed25519_dalek::SigningKey,
-        _default_mask: MaskProfile,
+        default_mask: MaskProfile,
     ) -> Self {
         Self {
             sessions: DashMap::new(),
@@ -377,6 +379,7 @@ impl SessionManager {
             next_ip_octet: AtomicU32::new(2),
             server_keys,
             signing_key,
+            default_mask,
         }
     }
     
@@ -458,6 +461,8 @@ impl SessionManager {
         {
             let mut sess = session.lock();
             sess.state = SessionState::Active;
+            sess.mask = Some(self.default_mask.clone());
+            sess.fsm_state = self.default_mask.fsm_initial_state;
             
             // Store ratchet data
             sess.server_eph_pub = Some(server_eph_pub);

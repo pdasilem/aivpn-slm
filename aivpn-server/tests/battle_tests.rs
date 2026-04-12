@@ -1019,7 +1019,7 @@ fn test_neural_anomaly_detector_normal() {
     let mut module = NeuralResonanceModule::new(config).unwrap();
     // Record normal metrics
     for _ in 0..20 {
-        module.record_telemetry("webrtc_zoom_v3", 0.005, 30.0);
+        module.record_telemetry("webrtc_zoom_v3", 0.005, 30.0, 10.0, 5);
     }
     assert!(!module.is_mask_anomalous("webrtc_zoom_v3"), "Normal traffic should not be anomalous");
 }
@@ -1030,7 +1030,7 @@ fn test_neural_anomaly_detector_high_loss() {
     let mut module = NeuralResonanceModule::new(config).unwrap();
     // Record anomalous packet loss (5x baseline = 5%)
     for _ in 0..20 {
-        module.record_telemetry("webrtc_zoom_v3", 0.10, 30.0);
+        module.record_telemetry("webrtc_zoom_v3", 0.10, 30.0, 10.0, 5);
     }
     assert!(module.is_mask_anomalous("webrtc_zoom_v3"), "10% packet loss must trigger anomaly");
 }
@@ -1041,7 +1041,7 @@ fn test_neural_anomaly_detector_high_rtt() {
     let mut module = NeuralResonanceModule::new(config).unwrap();
     // Record anomalous RTT (3x baseline = 150ms)
     for _ in 0..20 {
-        module.record_telemetry("quic_https_v2", 0.001, 200.0);
+        module.record_telemetry("quic_https_v2", 0.001, 200.0, 10.0, 5);
     }
     assert!(module.is_mask_anomalous("quic_https_v2"), "200ms RTT must trigger anomaly");
 }
