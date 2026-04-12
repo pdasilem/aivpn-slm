@@ -15,6 +15,7 @@ import org.json.JSONObject
  * Keys are encrypted with Android Keystore — safe from root access.
  */
 object SecureStorage {
+    const val BUILTIN_QR_SCANNER = "__builtin__"
 
     private const val PREFS_FILE = "aivpn_secure_prefs"
 
@@ -103,6 +104,30 @@ object SecureStorage {
 
     fun loadActiveProfileId(context: Context): String {
         return loadString(context, "active_profile_id")
+    }
+
+    fun saveDefaultQrScannerPackage(context: Context, packageName: String) {
+        saveString(context, "default_qr_scanner_package", packageName)
+    }
+
+    fun loadDefaultQrScannerPackage(context: Context): String {
+        return loadString(context, "default_qr_scanner_package", BUILTIN_QR_SCANNER)
+    }
+
+    fun clearDefaultQrScannerPackage(context: Context) {
+        remove(context, "default_qr_scanner_package")
+    }
+
+    fun saveAutoConnectProfileId(context: Context, id: String) {
+        saveString(context, "auto_connect_profile_id", id)
+    }
+
+    fun loadAutoConnectProfileId(context: Context): String {
+        return loadString(context, "auto_connect_profile_id")
+    }
+
+    fun clearAutoConnectProfileId(context: Context) {
+        remove(context, "auto_connect_profile_id")
     }
 
     // ──────────── Split tunneling ────────────

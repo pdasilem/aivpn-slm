@@ -28,6 +28,18 @@ val hasReleaseSigning = listOf(
     releaseKeyPassword,
 ).all { !it.isNullOrBlank() }
 
+val configuredAbis = (
+    System.getenv("AIVPN_ANDROID_ABIS")
+        ?.split(',')
+        ?.map { it.trim() }
+        ?.filter { it.isNotEmpty() }
+        ?.takeIf { it.isNotEmpty() }
+) ?: listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+
+val universalDebugApk = System.getenv("AIVPN_ANDROID_UNIVERSAL_DEBUG_APK")
+    ?.equals("true", ignoreCase = true)
+    ?: false
+
 android {
     namespace = "com.aivpn.client"
     compileSdk = 36
@@ -36,8 +48,8 @@ android {
         applicationId = "com.aivpn.client"
         minSdk = 26
         targetSdk = 36
-        versionCode = 12
-        versionName = "0.5.7"
+        versionCode = 16
+        versionName = "0.5.11"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -98,8 +110,8 @@ android {
         abi {
             isEnable = true
             reset()
-            include("arm64-v8a", "armeabi-v7a", "x86_64")
-            isUniversalApk = true
+            include(*configuredAbis.toTypedArray())
+            isUniversalApk = universalDebugApk
         }
     }
 }
@@ -115,6 +127,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
     implementation("androidx.security:security-crypto:1.1.0")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")

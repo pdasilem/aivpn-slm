@@ -17,6 +17,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import com.aivpn.client.databinding.ActivityMainBinding
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import org.json.JSONObject
 import java.util.Base64
 import java.util.Locale
@@ -63,15 +65,13 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, getString(R.string.error_qr_empty), Toast.LENGTH_SHORT).show()
             return@registerForActivityResult
         }
-        pendingScanTarget?.setText(value.trim())
-        pendingScanTarget?.setSelection(pendingScanTarget?.text?.length ?: 0)
-        pendingScanNameTarget?.let { nameInput ->
-            if (nameInput.text.toString().trim().isEmpty()) {
-                val nextName = buildDefaultProfileName()
-                nameInput.setText(nextName)
-                nameInput.setSelection(nextName.length)
-            }
-        }
+        applyScannedQrValue(value)
+    }
+
+    private val embeddedQrScanLauncher = registerForActivityResult(ScanContract()) { result ->
+        val value = result.contents
+        if (value.isNullOrBlank()) return@registerForActivityResult
+        applyScannedQrValue(value)
     }
 
     // Connection timer
@@ -130,6 +130,9 @@ class MainActivity : AppCompatActivity() {
         binding.btnSplitTunnel.setOnClickListener {
             startActivity(Intent(this, SplitTunnelActivity::class.java))
         }
+        binding.btnSettings.setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
 
         updateSplitTunnelHint()
 
@@ -138,6 +141,8 @@ class MainActivity : AppCompatActivity() {
             isConnected = true
             updateUI(true, AivpnService.lastStatusText)
         }
+
+        maybeAutoConnectOnLaunch(savedInstanceState)
     }
 
     // ──────────── Profile management ────────────
@@ -328,15 +333,76 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun launchQrScanner() {
-        val intent = Intent("com.google.zxing.client.android.SCAN").apply {
-            putExtra("SCAN_MODE", "QR_CODE_MODE")
-            putExtra("PROMPT_MESSAGE", "Scan AIVPN connection QR")
+        val defaultPackage = SecureStorage.loadDefaultQrScannerPackage(this)
+        if (
+            defaultPackage.isBlank()
+            || defaultPackage == SecureStorage.BUILTIN_QR_SCANNER
+        ) {
+            launchEmbeddedQrScanner()
+            return
         }
+
+        val candidates = QrScannerSupport.queryScannerApps(this)
+        if (candidates.any { it.packageName == defaultPackage }) {
+            launchQrScannerIntent(QrScannerSupport.buildScanIntent().setPackage(defaultPackage), defaultPackage)
+            return
+        }
+
+        SecureStorage.saveDefaultQrScannerPackage(this, SecureStorage.BUILTIN_QR_SCANNER)
+        launchEmbeddedQrScanner()
+    }
+
+    private fun launchQrScannerIntent(intent: Intent, packageName: String) {
         try {
             qrScanLauncher.launch(intent)
         } catch (_: ActivityNotFoundException) {
-            Toast.makeText(this, getString(R.string.error_no_qr_scanner), Toast.LENGTH_LONG).show()
+            SecureStorage.saveDefaultQrScannerPackage(this, SecureStorage.BUILTIN_QR_SCANNER)
+            Toast.makeText(
+                this,
+                getString(R.string.error_qr_scanner_unavailable, packageName),
+                Toast.LENGTH_LONG
+            ).show()
+            launchEmbeddedQrScanner()
         }
+    }
+
+    private fun launchEmbeddedQrScanner() {
+        val options = ScanOptions().apply {
+            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+            setPrompt(getString(R.string.qr_scan_prompt))
+            setBeepEnabled(false)
+            setOrientationLocked(false)
+            setCaptureActivity(EmbeddedQrScannerActivity::class.java)
+        }
+        embeddedQrScanLauncher.launch(options)
+    }
+
+    private fun applyScannedQrValue(value: String) {
+        val trimmed = value.trim()
+        pendingScanTarget?.setText(trimmed)
+        pendingScanTarget?.setSelection(pendingScanTarget?.text?.length ?: 0)
+        pendingScanNameTarget?.let { nameInput ->
+            if (nameInput.text.toString().trim().isEmpty()) {
+                val nextName = buildDefaultProfileName()
+                nameInput.setText(nextName)
+                nameInput.setSelection(nextName.length)
+            }
+        }
+    }
+
+    private fun maybeAutoConnectOnLaunch(savedInstanceState: Bundle?) {
+        if (savedInstanceState != null || isConnected || AivpnService.isRunning) return
+        val autoProfileId = SecureStorage.loadAutoConnectProfileId(this)
+        if (autoProfileId.isBlank()) return
+        val profile = profiles.firstOrNull { it.id == autoProfileId } ?: run {
+            SecureStorage.clearAutoConnectProfileId(this)
+            return
+        }
+        activeProfileId = profile.id
+        SecureStorage.saveActiveProfileId(this, profile.id)
+        binding.editConnectionKey.setText(profile.key)
+        renderProfiles()
+        binding.root.post { connect() }
     }
 
     private fun confirmDeleteProfile(profile: SecureStorage.ConnectionProfile) {

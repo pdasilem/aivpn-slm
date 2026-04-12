@@ -19,7 +19,7 @@ use tracing::{info, warn, error, debug};
 use aivpn_common::crypto::{self, decrypt_payload, TAG_SIZE, NONCE_SIZE};
 use aivpn_common::client_wire::{
     build_fragment_inner_packet, build_masked_packet, mask_mdh_len, max_data_payload_len,
-    max_fragment_payload_len,
+    max_fragment_payload_len, DEFAULT_ZERO_MDH,
 };
 use aivpn_common::fragment::{FragmentAssembler, FragmentHeader, FRAGMENT_HEADER_LEN};
 use aivpn_common::protocol::{
@@ -865,9 +865,16 @@ impl Gateway {
             };
             (session, counter, is_ratcheted, mdh_len)
         } else {
-            let mdh_len = 4;
-            // No session found — try handshake
-            // Try to establish a new one from eph_pub in MDH
+            let mdh_len = DEFAULT_ZERO_MDH.len();
+            // No session found. Only the zero-MDH bootstrap packet is allowed to enter
+            // the new-session PSK path. Any other unknown tag belongs to non-bootstrap
+            // traffic and must not be reinterpreted as a fresh handshake.
+            if packet_data.len() < TAG_SIZE + mdh_len
+                || &packet_data[TAG_SIZE..TAG_SIZE + mdh_len] != DEFAULT_ZERO_MDH
+            {
+                return Err(Error::InvalidPacket("Unknown tag for non-bootstrap packet"));
+            }
+            // Try to establish a new one from eph_pub in bootstrap MDH.
             if packet_data.len() < TAG_SIZE + mdh_len + 32 {
                 self.metrics.record_handshake_failure();
                 return Err(Error::InvalidPacket("Too short for session init"));

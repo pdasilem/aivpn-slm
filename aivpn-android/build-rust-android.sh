@@ -117,8 +117,50 @@ TARGETS=(
     "x86_64:x86_64-linux-android"
 )
 
-for entry in "${TARGETS[@]}"; do
-    ABI="${entry%%:*}"
+pick_debug_abis() {
+    if [[ -n "${AIVPN_ANDROID_ABIS:-}" ]]; then
+        echo "${AIVPN_ANDROID_ABIS}"
+        return 0
+    fi
+
+    if [[ "${BUILD_TYPE}" != "debug" ]]; then
+        printf '%s\n' "arm64-v8a,armeabi-v7a,x86_64"
+        return 0
+    fi
+
+    if command -v adb >/dev/null 2>&1; then
+        local serial abi
+        serial="$(adb devices | awk 'NR>1 && $2=="device" {print $1; exit}')"
+        if [[ -n "${serial}" ]]; then
+            abi="$(adb -s "${serial}" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
+            case "${abi}" in
+                arm64-v8a|armeabi-v7a|x86_64)
+                    echo "${abi}"
+                    return 0
+                    ;;
+            esac
+        fi
+    fi
+
+    echo "arm64-v8a"
+}
+
+SELECTED_ABIS="$(pick_debug_abis)"
+IFS=',' read -r -a ABI_LIST <<< "${SELECTED_ABIS}"
+
+declare -A ABI_MAP=(
+    ["arm64-v8a"]="aarch64-linux-android"
+    ["armeabi-v7a"]="armv7-linux-androideabi"
+    ["x86_64"]="x86_64-linux-android"
+)
+
+for ABI in "${ABI_LIST[@]}"; do
+    ABI="$(echo "${ABI}" | xargs)"
+    TARGET_TRIPLE="${ABI_MAP[${ABI}]:-}"
+    if [[ -z "${TARGET_TRIPLE}" ]]; then
+        echo "ERROR: Unsupported ABI '${ABI}'. Supported: arm64-v8a, armeabi-v7a, x86_64"
+        exit 1
+    fi
     echo "--> [${ABI}]  cargo ndk -t ${ABI}"
 
     (
@@ -219,9 +261,15 @@ if [[ "${BUILD_TYPE}" == "release" ]]; then
 else
     (
         cd "${SCRIPT_DIR}"
+        AIVPN_ANDROID_ABIS="${SELECTED_ABIS}" \
+        AIVPN_ANDROID_UNIVERSAL_DEBUG_APK=false \
         ./gradlew "${GRADLE_ARGS[@]}" app:assembleDebug
     )
-    DEBUG_APK="${SCRIPT_DIR}/app/build/outputs/apk/debug/app-universal-debug.apk"
+    if [[ "${#ABI_LIST[@]}" -eq 1 ]]; then
+        DEBUG_APK="${SCRIPT_DIR}/app/build/outputs/apk/debug/app-${ABI_LIST[0]}-debug.apk"
+    else
+        DEBUG_APK="${SCRIPT_DIR}/app/build/outputs/apk/debug/app-universal-debug.apk"
+    fi
     if [[ -f "${DEBUG_APK}" ]]; then
         cp -f "${DEBUG_APK}" "${APK_DST}"
         echo "  Copied debug APK -> ${APK_DST}"
